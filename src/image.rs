@@ -1,6 +1,7 @@
 use crate::coord::Coord;
+use minifb;
 use std::assert;
-use std::ops::{Deref, Sub};
+use std::ops::Deref;
 
 pub const N_SUBPX: usize = 4;
 pub type Subpx = u8;
@@ -96,7 +97,6 @@ impl<T: Deref<Target = [Subpx]>> Image<T> {
     }
 
     pub fn show(&self) {
-        use minifb;
         let (w, h) = (self.w, self.h);
         let buf_packed: Vec<u32> = (0..self.w * self.h)
             .map(|idx| self.get_pixel(idx).packed())
@@ -105,6 +105,7 @@ impl<T: Deref<Target = [Subpx]>> Image<T> {
             minifb::Window::new("Image", w, h, minifb::WindowOptions::default()).unwrap();
         window.limit_update_rate(Some(std::time::Duration::from_micros(16600)));
         while window.is_open() && !window.is_key_down(minifb::Key::Escape) {
+            window.set_position(-1920, 0);
             window.update_with_buffer(&buf_packed, w, h).unwrap();
             std::thread::sleep(std::time::Duration::from_secs_f32(0.5));
             break;

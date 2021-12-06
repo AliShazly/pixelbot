@@ -460,6 +460,7 @@ version = "0.1.0"
 dependencies = [
  "interception",
  "minifb",
+ "rand",
  "scrap",
  "windows",
 ]
