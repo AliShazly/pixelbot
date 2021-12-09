@@ -1,5 +1,5 @@
 [package]
-name = "pixel"
+name = "pixelbot"
 version = "0.1.0"
 edition = "2021"
 
@@ -10,6 +10,8 @@ scrap = "0.5"
 minifb = "0.20"
 interception = "0.1.2"
 rand = "0.8.4"
+fltk = "^1.2"
+num_enum = "0.5.4"
 
 [dependencies.windows]
 version = "0.28.0"

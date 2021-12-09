@@ -81,7 +81,7 @@ impl<T: Deref<Target = [Subpx]>> Image<T> {
         self.buf.iter()
     }
 
-    pub fn pixels<'a>(&'a self) -> impl Iterator<Item = Pixel> + 'a {
+    pub fn pixels(&self) -> impl Iterator<Item = Pixel> + '_ {
         self.buf
             .chunks_exact(N_SUBPX)
             .map(|slice| Pixel::from_slice(slice, self.pixel_order))
@@ -107,8 +107,6 @@ impl<T: Deref<Target = [Subpx]>> Image<T> {
         while window.is_open() && !window.is_key_down(minifb::Key::Escape) {
             window.set_position(-1920, 0);
             window.update_with_buffer(&buf_packed, w, h).unwrap();
-            std::thread::sleep(std::time::Duration::from_secs_f32(0.5));
-            break;
         }
     }
 }
