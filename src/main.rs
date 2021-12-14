@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(unused_imports)]
 
 mod config;
 mod coord;
@@ -6,189 +7,69 @@ mod gui;
 mod image;
 mod img_funcs;
 mod input;
+mod pixel_bot;
 
-use coord::Coord;
-use gui::gui;
-use image::{Image, Pixel, PixelOrder};
-use img_funcs::{color_range_avg_pos, crop_to_center};
-use input::{key_pressed, wait_for_release, InterceptionState};
+use config::{CfgKey, CfgValue, Config};
+use gui::{Gui, Message};
+use pixel_bot::PixelBot;
+use std::panic;
+use std::sync::{mpsc, Arc, RwLock};
 
-use rand::{self, Rng};
-use scrap;
-use std::io::ErrorKind::WouldBlock;
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
-
-const TARGET_COLOR: Pixel = Pixel {
-    //cerise
-    r: 196,
-    g: 58,
-    b: 172,
-};
-const CROP_W: u32 = 1152;
-const CROP_H: u32 = 592;
-const COLOR_THRESH: f32 = 0.83;
-const SENS: f32 = 3.;
-const FPS: u32 = 144;
-const Y_DIVISOR: f32 = 1.3;
-const AIM_KEYCODE: i32 = 0x01; //0x06
-const TOGGLE_KEYCODE: i32 = 0xBE; // .
-const TOGGLE_AUTOCLICK_KEYCODE: i32 = 0xBC; // ,
-const AUTOCLICK_INBTWN_SLEEP_MS: std::ops::Range<u32> = 19..66;
-const AIM_DURATION: Duration = Duration::from_micros(50);
-const AIM_STEPS: u32 = 2;
-
-pub fn spawn_click_thread() {
-    thread::spawn(|| {
-        #[derive(Debug)]
-        enum ClickMode {
-            Regular,          // Good ole bread and butter, the classic
-            Auto,             // Repeatedly presses mmb when holding lmb
-            Redirected(bool), // mmb presses mirror lmb clicks, stores whether pressed
-        }
-
-        let mut click_mode = ClickMode::Regular;
-        let mut interception = InterceptionState::new();
-        interception.capture_mouse();
-
-        let mut rng = rand::thread_rng();
-
-        println!("Clickmode: {:?}. Starting click thread...", click_mode);
-        loop {
-            thread::sleep(Duration::from_millis(1));
-
-            // Cycling to the next clickmode when the toggle key is pressed
-            if key_pressed(TOGGLE_AUTOCLICK_KEYCODE) {
-                click_mode = match click_mode {
-                    ClickMode::Regular => ClickMode::Auto,
-                    ClickMode::Auto => ClickMode::Redirected(false),
-                    ClickMode::Redirected(is_pressed) => {
-                        // if the clickmode was cycled while redirectedclick was pressed down, we reset it.
-                        if is_pressed {
-                            interception.click_up()
-                        }
-                        ClickMode::Regular
-                    }
-                };
-                println!("Toggled clickmode to {:?}.", click_mode);
-                wait_for_release(TOGGLE_AUTOCLICK_KEYCODE);
-            }
-
-            match click_mode {
-                ClickMode::Regular => {}
-                ClickMode::Auto => {
-                    if key_pressed(AIM_KEYCODE) {
-                        interception.click_down();
-                        thread::sleep(Duration::from_millis(
-                            rng.gen_range(AUTOCLICK_INBTWN_SLEEP_MS).into(),
-                        ));
-                        interception.click_up();
-                        thread::sleep(Duration::from_millis(
-                            rng.gen_range(AUTOCLICK_INBTWN_SLEEP_MS).into(),
-                        ));
-                    }
-                }
-                ClickMode::Redirected(ref mut was_pressed) => {
-                    if key_pressed(AIM_KEYCODE) {
-                        if !*was_pressed {
-                            interception.click_down();
-                            *was_pressed = true;
-                        }
-                    } else if *was_pressed {
-                        interception.click_up();
-                        *was_pressed = false;
-                    }
-                }
-            }
-        }
-    });
-}
-
-pub fn spawn_aim_thread(receiver: mpsc::Receiver<Coord<i32>>) {
-    thread::spawn(move || {
-        let mut enabled = true;
-        let mut interception = InterceptionState::new();
-        interception.capture_mouse();
-
-        println!(
-            "Aim {}. Starting aim thread...",
-            if enabled { "enabled" } else { "disabled" }
-        );
-        loop {
-            // getting the most recent item in the reciever queue
-            if let Some(coord) = receiver.try_iter().last() {
-                if enabled && key_pressed(AIM_KEYCODE) {
-                    interception.move_mouse_over_time(AIM_DURATION, AIM_STEPS, coord);
-                }
-                if key_pressed(TOGGLE_KEYCODE) {
-                    enabled = !enabled;
-                    println!("Aim {}.", if enabled { "enabled" } else { "disabled" });
-                    wait_for_release(TOGGLE_KEYCODE);
-                }
-            }
-        }
-    });
+// Kills the entire process if one thread panics
+fn set_panic_hook() {
+    let orig_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |panic_info| {
+        orig_hook(panic_info);
+        std::process::exit(1);
+    }));
 }
 
 fn main() {
-    gui();
-    panic!();
-
-    let one_frame = Duration::new(1, 0) / FPS;
-
-    let display = scrap::Display::primary().unwrap();
-    let mut capturer = scrap::Capturer::new(display).unwrap();
-    let (screen_w, screen_h) = (capturer.width(), capturer.height());
-    println!(
-        "Using primary display.\nScreen size: {}x{}",
-        screen_w, screen_h
-    );
-
+    set_panic_hook();
+    let config = Arc::new(RwLock::new(Config::from_file().unwrap()));
     let (sender, receiver) = mpsc::channel();
-    spawn_aim_thread(receiver);
-    spawn_click_thread();
 
-    println!("Init finished");
-    loop {
-        // let now = Instant::now();
+    let d = scrap::Display::primary().unwrap();
+    let (width, height) = (d.width() as u32, d.height() as u32);
+    drop(d);
 
-        // Grab DXGI buffer
-        let buffer = match capturer.frame() {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                if error.kind() == WouldBlock {
-                    thread::sleep(one_frame);
-                    continue;
-                } else {
-                    panic!("Error: {}", error);
+    // Setting crop_w and crop_h bounds relative to screen size
+    let crop_w = config.read().unwrap().get(CfgKey::CropW).val;
+    let crop_h = config.read().unwrap().get(CfgKey::CropH).val;
+    config
+        .write()
+        .unwrap()
+        .set(
+            CfgKey::CropW,
+            &CfgValue::new(crop_w, Some(0..width / 2)),
+            true,
+        )
+        .expect("Crop W out of bounds in config file");
+    config
+        .write()
+        .unwrap()
+        .set(
+            CfgKey::CropH,
+            &CfgValue::new(crop_h, Some(0..height / 2)),
+            true,
+        )
+        .expect("Crop H out of bounds in config file");
+
+    let mut pixel_bot = PixelBot::new(config.clone());
+    pixel_bot.start().unwrap(); // blocks waiting for mouse to move
+
+    let mut gui = Gui::new(1000, 1000, config.clone(), sender);
+    gui.create_crop_widget(100, 100, width as i32, height as i32, 0.2);
+    gui.init();
+
+    while gui.wait() {
+        // std::thread::sleep(std::time::Duration::from_millis(1));
+        if let Ok(msg) = receiver.try_recv() {
+            match msg {
+                Message::ChangedConfig => {
+                    pixel_bot.reload().unwrap();
                 }
             }
-        };
-
-        // Crop image
-        let cropped = crop_to_center(
-            &Image::new(&(*buffer), PixelOrder::BGRA, screen_w, screen_h),
-            CROP_W as usize,
-            CROP_H as usize,
-        );
-
-        // Search through image and find avg position of the target color
-        let relative_coord =
-            match color_range_avg_pos(&cropped, TARGET_COLOR, COLOR_THRESH, Y_DIVISOR) {
-                Some(coord) => Coord::new(
-                    // making coord relative to center
-                    coord.x as i32 - (cropped.w / 2) as i32,
-                    coord.y as i32 - (cropped.h / 2) as i32,
-                ),
-                None => Coord::new(0, 0),
-            };
-
-        let aim_x = (relative_coord.x as f32 / SENS) as i32;
-        let aim_y = (relative_coord.y as f32 / SENS) as i32;
-
-        sender.send(Coord::new(aim_x, aim_y)).unwrap();
-
-        // println!("{:?}", now.elapsed());
+        }
     }
 }

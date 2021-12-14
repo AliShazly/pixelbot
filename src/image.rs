@@ -1,5 +1,4 @@
 use crate::coord::Coord;
-use minifb;
 use std::assert;
 use std::ops::Deref;
 

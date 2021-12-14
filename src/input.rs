@@ -24,26 +24,37 @@ impl Empty for Stroke {
     }
 }
 
+trait CaptureMouse {
+    fn capture_mouse(&mut self) -> i32;
+}
+
+impl CaptureMouse for Interception {
+    fn capture_mouse(&mut self) -> i32 {
+        println!("Looking for mouse...");
+        self.set_filter(is_mouse, Filter::MouseFilter(MouseState::MOVE));
+        let mouse_dev = self.wait();
+        self.set_filter(is_mouse, Filter::MouseFilter(MouseState::empty()));
+        println!("Found mouse");
+        mouse_dev
+    }
+}
+
 pub struct InterceptionState {
     interception: Interception,
     mouse_dev: Device,
 }
 
 impl InterceptionState {
-    pub fn new() -> Self {
+    pub fn new(dev: Option<Device>) -> Self {
+        let mut interception = Interception::new().expect("Error initializing interception");
+        let mouse_dev = match dev {
+            Some(d) => d,
+            None => interception.capture_mouse(),
+        };
         InterceptionState {
-            interception: Interception::new().expect("Error initializing interception"),
-            mouse_dev: -1,
+            interception,
+            mouse_dev,
         }
-    }
-    pub fn capture_mouse(&mut self) {
-        println!("Looking for mouse...");
-        self.interception
-            .set_filter(is_mouse, Filter::MouseFilter(MouseState::MOVE));
-        self.mouse_dev = self.interception.wait();
-        self.interception
-            .set_filter(is_mouse, Filter::MouseFilter(MouseState::empty()));
-        println!("Found mouse");
     }
 
     pub fn click_down(&self) {
@@ -69,7 +80,7 @@ impl InterceptionState {
 
         for _ in 0..n_chunks {
             self.move_mouse_relative(Coord::new(chunked_x, chunked_y));
-            thread::sleep(sleep_dur);
+            spin_sleep::sleep(sleep_dur);
         }
     }
 
@@ -90,8 +101,15 @@ pub fn key_pressed(key_code: i32) -> bool {
     unsafe { GetAsyncKeyState(key_code) < 0 }
 }
 
-pub fn wait_for_release(key_code: i32) {
-    while key_pressed(key_code) {
-        // wait for release
+pub fn wait_for_release(key_code: i32, timeout: time::Duration) {
+    let now = time::Instant::now();
+    while key_pressed(key_code) && now.elapsed() <= timeout {
+        thread::sleep(time::Duration::from_millis(1));
     }
+}
+
+pub fn find_mouse_dev() -> i32 {
+    Interception::new()
+        .expect("Error initializing interception")
+        .capture_mouse()
 }

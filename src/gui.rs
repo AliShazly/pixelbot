@@ -1,69 +1,102 @@
-use crate::config::{CfgKey, CfgVal, Config};
+use crate::config::{CfgKey, CfgValue, Config};
 use fltk::{app::*, enums::*, frame::*, group::*, prelude::*, valuator::*, widget::*, window::*};
 use std::assert;
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::{mpsc, Arc, RwLock};
 
-#[derive(Clone, Copy)]
-enum Message {
-    ChangedCropBounds(f64, f64),
+pub enum Message {
+    ChangedConfig,
 }
 
+#[derive(Debug)]
 struct CropBox {
     bx: Group,
+    x_offset: i32,
+    y_offset: i32,
     max_w: i32,
     max_h: i32,
 }
 
-pub struct Gui<'a> {
+impl CropBox {
+    fn change_bounds(&mut self, x_percent: f64, y_percent: f64) {
+        if x_percent > 0. {
+            let x_pixels = (x_percent * self.max_w as f64).round() as i32;
+            let box_y = self.bx.y();
+            let box_h = self.bx.height();
+            self.bx.resize(
+                (x_pixels / 2) + self.x_offset,
+                box_y,
+                self.max_w - x_pixels,
+                box_h,
+            );
+        }
+        if y_percent > 0. {
+            let y_pixels = (y_percent * self.max_h as f64).round() as i32;
+            let box_x = self.bx.x();
+            let box_w = self.bx.width();
+            self.bx.resize(
+                box_x,
+                (y_pixels / 2) + self.y_offset,
+                box_w,
+                self.max_h - y_pixels,
+            );
+        }
+    }
+}
+
+trait NormalizedVal {
+    fn norm_val(&self) -> f64;
+}
+impl NormalizedVal for HorFillSlider {
+    fn norm_val(&self) -> f64 {
+        self.value() / self.maximum()
+    }
+}
+
+pub struct Gui {
     w: i32,
     h: i32,
     app: App,
-    window: Window,
-    sender: Sender<Message>,
-    receiver: Receiver<Message>,
-    crop_box: CropBox,
-    init_messages: Vec<Message>,
-    config: &'a mut Config,
+    window: Rc<RefCell<Window>>,
+    crop_box: Rc<RefCell<CropBox>>,
+    config: Arc<RwLock<Config>>,
+    sender: mpsc::Sender<Message>,
+    init_fns: Vec<Box<dyn Fn()>>,
 }
 
-impl<'a> Gui<'a> {
-    pub fn new(w: i32, h: i32, config: &'a mut Config) -> Self {
+impl Gui {
+    pub fn new(w: i32, h: i32, config: Arc<RwLock<Config>>, sender: mpsc::Sender<Message>) -> Self {
         let app = App::default();
-        let (sender, receiver) = channel::<Message>();
-        let window = Window::new(w / 2, h / 2, w, h, "ayooo");
+        let window = Rc::new(RefCell::new(Window::new(w / 2, h / 2, w, h, "ayooo")));
 
         Self {
             w,
             h,
             window,
             app,
-            sender,
-            receiver,
-            crop_box: CropBox {
+            crop_box: Rc::new(RefCell::new(CropBox {
                 bx: Group::default_fill(),
                 max_w: 0,
                 max_h: 0,
-            },
-            init_messages: Vec::new(),
+                x_offset: 0,
+                y_offset: 0,
+            })),
             config,
+            sender,
+            init_fns: Vec::new(),
         }
     }
 
-    // https://stackoverflow.com/questions/3971841/how-to-resize-images-proportionally-keeping-the-aspect-ratio
-    fn fit_size_to_aspect_ratio(orig_w: i32, orig_h: i32, cur_w: i32, cur_h: i32) -> (i32, i32) {
-        let ratio = (cur_w / orig_w).min(cur_h / orig_h);
-        (orig_w * ratio, orig_h * ratio)
-    }
-
-    fn create_slider(
-        &self,
+    fn cfg_slider(
+        &mut self,
+        cfg_key: CfgKey,
         x: i32,
         y: i32,
         w: i32,
         h: i32,
         label: &'static str,
-        cfg_key: CfgKey,
     ) -> HorFillSlider {
-        // let inner_pack = Pack::new(pack.x, pack.y, pack.w, pack.h, "");
         let mut slider = HorFillSlider::new(x, y, w, h, "");
         let mut label_frame = Frame::new(x, y, w, h, "");
         label_frame.set_label(label);
@@ -72,19 +105,31 @@ impl<'a> Gui<'a> {
         slider.set_color(Color::Dark2);
         slider.set_slider_frame(FrameType::EmbossedBox);
 
-        let cfg_val = self.config.get(cfg_key);
-        let (val, start, end) = match cfg_val {
-            CfgVal::U32(val, bounds) => (*val as f64, *bounds.start() as f64, *bounds.end() as f64),
-            CfgVal::F32(val, bounds) => (*val as f64, *bounds.start() as f64, *bounds.end() as f64),
-            _ => panic!("Invalid value for slider bounds"),
-        };
-        slider.set_value(val);
-        slider.set_bounds(start, end);
+        let cfg_value = self.config.read().unwrap().get(cfg_key);
+        let val_bounds = cfg_value.bounds.unwrap();
+        slider.set_value(cfg_value.val);
+        slider.set_bounds(val_bounds.start, val_bounds.end - 1.); // -1 since bounds are inclusive
         slider.set_precision(2);
 
+        // To make sure the slider label is always drawn on top of the slider
         slider.draw(move |s| {
             s.redraw();
             label_frame.redraw_label();
+        });
+
+        let config = self.config.clone();
+        let sender = self.sender.clone();
+        slider.handle(move |slider, ev| match ev {
+            Event::Released => {
+                config
+                    .write()
+                    .unwrap()
+                    .set(cfg_key, &CfgValue::new(slider.value(), None), false)
+                    .unwrap();
+                sender.send(Message::ChangedConfig).unwrap();
+                true
+            }
+            _ => false,
         });
         slider
     }
@@ -115,92 +160,58 @@ impl<'a> Gui<'a> {
         fg_box.set_color(Color::Green);
         fg_box.end();
 
-        self.crop_box = CropBox {
+        self.crop_box = Rc::new(RefCell::new(CropBox {
             bx: fg_box,
             max_w: box_w,
             max_h: box_h,
-        };
+            x_offset: x,
+            y_offset: y,
+        }));
 
         let mut slider1 =
-            self.create_slider(x, slider1_ypos, box_w, slider_h, "Crop X", CfgKey::CropW);
+            self.cfg_slider(CfgKey::CropW, x, slider1_ypos, box_w, slider_h, "Crop X");
         let mut slider2 =
-            self.create_slider(x, slider2_ypos, box_w, slider_h, "Crop Y", CfgKey::CropH);
+            self.cfg_slider(CfgKey::CropH, x, slider2_ypos, box_w, slider_h, "Crop Y");
 
-        let x_sender = self.sender;
-        slider1.handle(move |widg, ev| match ev {
-            Event::Drag => {
-                x_sender.send(Message::ChangedCropBounds(
-                    widg.value() as f64 / widg.maximum(),
-                    0.,
-                ));
-                true
-            }
-            _ => false,
-        });
-        let y_sender = self.sender;
-        slider2.handle(move |widg, ev| match ev {
-            Event::Drag => {
-                y_sender.send(Message::ChangedCropBounds(
-                    0.,
-                    widg.value() as f64 / widg.maximum(),
-                ));
-                true
-            }
-            _ => false,
+        let crop_box = self.crop_box.clone();
+        let window = self.window.clone();
+        slider1.set_callback(move |slider| {
+            crop_box
+                .try_borrow_mut()
+                .unwrap()
+                .change_bounds(slider.norm_val(), 0.);
+            window.try_borrow_mut().unwrap().redraw();
         });
 
-        self.init_messages.push(Message::ChangedCropBounds(
-            slider1.value() as f64 / slider1.maximum(),
-            slider2.value() as f64 / slider2.maximum(),
-        ));
+        let crop_box = self.crop_box.clone();
+        let window = self.window.clone();
+        slider2.set_callback(move |slider| {
+            crop_box
+                .try_borrow_mut()
+                .unwrap()
+                .change_bounds(0., slider.norm_val());
+            window.try_borrow_mut().unwrap().redraw();
+        });
+
+        let crop_box = self.crop_box.clone();
+        let (init_x_percent, init_y_percent) = (slider1.norm_val(), slider2.norm_val());
+        self.init_fns.push(Box::new(move || {
+            crop_box
+                .try_borrow_mut()
+                .unwrap()
+                .change_bounds(init_x_percent, init_y_percent);
+        }));
     }
 
-    pub fn main_loop(&mut self) {
-        self.window.end();
-        self.window.show();
-
-        for message in self.init_messages.iter() {
-            self.sender.send(*message);
-        }
-
-        while self.app.wait() {
-            if let Some(msg) = self.receiver.recv() {
-                match msg {
-                    Message::ChangedCropBounds(x_percent, y_percent) => {
-                        let max_w = self.crop_box.max_w;
-                        let max_h = self.crop_box.max_h;
-                        if x_percent > 0. {
-                            let x_pixels = (x_percent * max_w as f64).round() as i32;
-                            self.crop_box.bx.resize(
-                                x_pixels / 2,
-                                self.crop_box.bx.y(),
-                                max_w - x_pixels,
-                                self.crop_box.bx.height(),
-                            );
-                        }
-                        if y_percent > 0. {
-                            let y_pixels = (y_percent * max_h as f64).round() as i32;
-                            self.crop_box.bx.resize(
-                                self.crop_box.bx.x(),
-                                y_pixels / 2,
-                                self.crop_box.bx.width(),
-                                max_h - y_pixels,
-                            );
-                        }
-                        self.window.redraw();
-                    }
-                }
-            }
+    pub fn init(&mut self) {
+        self.window.borrow().end();
+        self.window.try_borrow_mut().unwrap().show();
+        for init_fn in self.init_fns.iter() {
+            init_fn();
         }
     }
-}
 
-pub fn gui() {
-    let w = 1000;
-    let h = 1000;
-
-    let mut config = Config::default();
-    let mut gui = Gui::new(w, h, &mut config);
-    gui.create_crop_widget(0, 0, 1920, 1080, 0.2);
-    gui.main_loop();
+    pub fn wait(&self) -> bool {
+        self.app.wait()
+    }
 }
