@@ -1,16 +1,104 @@
 use crate::config::{CfgKey, CfgValue, Config};
-use fltk::{app::*, enums::*, frame::*, group::*, prelude::*, valuator::*, widget::*, window::*};
+use crate::coord::Coord;
+use crate::image::image_ops::{self, blend_fns};
+use crate::image::{Image, Pixel, PixelOrder, N_SUBPX};
+
+use fltk::{
+    app::{self, *},
+    draw::*,
+    enums::*,
+    frame::*,
+    group::*,
+    prelude::*,
+    valuator::*,
+    widget::*,
+    window::*,
+};
 use std::assert;
 use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, RwLock};
+use std::time::{Duration, Instant};
 
 pub enum Message {
     ChangedConfig,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Bounds {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+impl Bounds {
+    pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
+        Self { x, y, w, h }
+    }
+}
+
+struct Graph {
+    b: Bounds,
+    receiver: mpsc::Receiver<Duration>,
+    data_range: Range<i32>,
+    points: VecDeque<Coord<i32>>,
+    img: Image<Vec<u8>>,
+    current_time: Instant,
+}
+
+impl Graph {
+    fn new(b: Bounds, receiver: mpsc::Receiver<Duration>, data_range: Range<i32>) -> Self {
+        Self {
+            b,
+            receiver,
+            data_range,
+            points: VecDeque::new(),
+            img: Image::new(
+                vec![0; b.w as usize * b.h as usize * N_SUBPX],
+                PixelOrder::RGBA,
+                b.w as usize,
+                b.h as usize,
+            ),
+            current_time: Instant::now(),
+        }
+    }
+
+    pub fn tick(&mut self) -> Option<Vec<Coord<i32>>> {
+        const INC: i32 = 1;
+        const TICK_FREQ: Duration = Duration::from_millis(1);
+
+        if self.current_time.elapsed() < TICK_FREQ {
+            return None;
+        }
+
+        if let Some(time) = self.receiver.try_iter().last() {
+            let time_norm = clamp(
+                1. - ((time.as_millis() as i32 - self.data_range.start) as f32
+                    / self.data_range.end as f32),
+                0.,
+                1.,
+            );
+            let y_scaled = (self.b.h - 1) as f32 * time_norm;
+
+            self.points.iter_mut().for_each(|c| (*c).x += INC);
+            self.points.push_back(Coord::new(0, y_scaled as i32));
+            if self.points.len() > self.b.w as usize {
+                self.points.pop_front();
+            };
+            self.current_time = Instant::now();
+            Some(self.points.iter().copied().collect())
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CropBox {
+    bg_bx: Group,
     bx: Group,
     x_offset: i32,
     y_offset: i32,
@@ -42,6 +130,8 @@ impl CropBox {
                 self.max_h - y_pixels,
             );
         }
+        self.bg_bx.redraw();
+        self.bx.redraw();
     }
 }
 
@@ -58,7 +148,7 @@ pub struct Gui {
     w: i32,
     h: i32,
     app: App,
-    window: Rc<RefCell<Window>>,
+    window: Window,
     crop_box: Rc<RefCell<CropBox>>,
     config: Arc<RwLock<Config>>,
     sender: mpsc::Sender<Message>,
@@ -68,7 +158,8 @@ pub struct Gui {
 impl Gui {
     pub fn new(w: i32, h: i32, config: Arc<RwLock<Config>>, sender: mpsc::Sender<Message>) -> Self {
         let app = App::default();
-        let window = Rc::new(RefCell::new(Window::new(w / 2, h / 2, w, h, "ayooo")));
+        app::set_visible_focus(false);
+        let window = Window::new(w / 2, h / 2, w, h, "ayooo");
 
         Self {
             w,
@@ -77,6 +168,7 @@ impl Gui {
             app,
             crop_box: Rc::new(RefCell::new(CropBox {
                 bx: Group::default_fill(),
+                bg_bx: Group::default_fill(),
                 max_w: 0,
                 max_h: 0,
                 x_offset: 0,
@@ -86,6 +178,40 @@ impl Gui {
             sender,
             init_fns: Vec::new(),
         }
+    }
+
+    pub fn create_graph(
+        &self,
+        b: Bounds,
+        receiver: mpsc::Receiver<Duration>,
+        graph_range_ms: Range<i32>,
+        color: Pixel,
+    ) {
+        let mut frm = Frame::default().with_pos(b.x, b.y).with_size(b.w, b.h);
+        let mut graph = Graph::new(
+            Bounds::new(frm.x(), frm.y(), frm.w(), frm.h()),
+            receiver,
+            graph_range_ms,
+        );
+        let graph_buf = vec![0u8; b.h as usize * b.w as usize * N_SUBPX];
+        let mut graph_img = Image::new(graph_buf, PixelOrder::RGBA, b.w as usize, b.h as usize);
+        let bg_buf = vec![0u8; b.h as usize * b.w as usize * N_SUBPX];
+        let mut bg_img = Image::new(bg_buf, PixelOrder::RGBA, b.w as usize, b.h as usize);
+        bg_img.fill_color(Pixel::new(0, 0, 255, 255));
+        bg_img.draw_grid(30, Pixel::new(0, 255, 0, 255));
+        app::add_idle(move || {
+            if let Some(coords) = graph.tick() {
+                frm.redraw();
+                coords.windows(2).for_each(|coords| {
+                    let p1 = coords[0];
+                    let p2 = coords[1];
+                    graph_img.draw_line(Coord::new(p1.y, p1.x), Coord::new(p2.y, p2.x), color);
+                });
+                graph_img.blend(blend_fns::over, &bg_img);
+                draw_rgba(&mut frm, graph_img.as_slice()).unwrap();
+                graph_img.fill_zeroes();
+            }
+        });
     }
 
     fn cfg_slider(
@@ -98,8 +224,7 @@ impl Gui {
         label: &'static str,
     ) -> HorFillSlider {
         let mut slider = HorFillSlider::new(x, y, w, h, "");
-        let mut label_frame = Frame::new(x, y, w, h, "");
-        label_frame.set_label(label);
+        let mut label_frame = Frame::new(x, y, w, h, "").with_label(label);
         label_frame.set_label_font(Font::HelveticaBold);
         label_frame.set_label_size((h as f32 / 2.7) as i32);
         slider.set_color(Color::Dark2);
@@ -134,63 +259,53 @@ impl Gui {
         slider
     }
 
-    pub fn create_crop_widget(
-        &mut self,
-        x: i32,
-        y: i32,
-        screen_w: i32,
-        screen_h: i32,
-        scalar: f32,
-    ) {
+    pub fn create_crop_widget(&mut self, b: Bounds, scalar: f32) {
         assert!(std::ops::RangeInclusive::new(0., 1.).contains(&scalar));
 
-        let box_w = (screen_w as f32 * scalar) as i32;
-        let box_h = (screen_h as f32 * scalar) as i32;
+        let box_w = (b.w as f32 * scalar) as i32;
+        let box_h = (b.h as f32 * scalar) as i32;
         let slider_h = self.h / 20;
-        let slider1_ypos = y + box_h;
+        let slider1_ypos = b.y + box_h;
         let slider2_ypos = slider1_ypos + slider_h;
 
-        let mut bg_box = Group::new(x, y, box_w, box_h, "");
+        let mut bg_box = Group::new(b.x, b.y, box_w, box_h, "");
         bg_box.set_frame(FrameType::FlatBox);
         bg_box.set_color(Color::Red);
         bg_box.end();
 
-        let mut fg_box = Group::new(x, y, box_w, box_h, "");
+        let mut fg_box = Group::new(b.x, b.y, box_w, box_h, "");
         fg_box.set_frame(FrameType::FlatBox);
         fg_box.set_color(Color::Green);
         fg_box.end();
 
         self.crop_box = Rc::new(RefCell::new(CropBox {
             bx: fg_box,
+            bg_bx: bg_box,
             max_w: box_w,
             max_h: box_h,
-            x_offset: x,
-            y_offset: y,
+            x_offset: b.x,
+            y_offset: b.y,
         }));
 
         let mut slider1 =
-            self.cfg_slider(CfgKey::CropW, x, slider1_ypos, box_w, slider_h, "Crop X");
+            self.cfg_slider(CfgKey::CropW, b.x, slider1_ypos, box_w, slider_h, "Crop X");
         let mut slider2 =
-            self.cfg_slider(CfgKey::CropH, x, slider2_ypos, box_w, slider_h, "Crop Y");
+            self.cfg_slider(CfgKey::CropH, b.x, slider2_ypos, box_w, slider_h, "Crop Y");
 
         let crop_box = self.crop_box.clone();
-        let window = self.window.clone();
         slider1.set_callback(move |slider| {
             crop_box
                 .try_borrow_mut()
                 .unwrap()
                 .change_bounds(slider.norm_val(), 0.);
-            window.try_borrow_mut().unwrap().redraw();
         });
 
         let crop_box = self.crop_box.clone();
-        let window = self.window.clone();
         slider2.set_callback(move |slider| {
             crop_box
                 .try_borrow_mut()
                 .unwrap()
                 .change_bounds(0., slider.norm_val());
-            window.try_borrow_mut().unwrap().redraw();
         });
 
         let crop_box = self.crop_box.clone();
@@ -204,14 +319,27 @@ impl Gui {
     }
 
     pub fn init(&mut self) {
-        self.window.borrow().end();
-        self.window.try_borrow_mut().unwrap().show();
+        self.window.end();
+        self.window.show();
         for init_fn in self.init_fns.iter() {
             init_fn();
         }
     }
 
-    pub fn wait(&self) -> bool {
+    pub fn wait(&mut self) -> bool {
         self.app.wait()
+    }
+}
+
+fn clamp<T>(val: T, min: T, max: T) -> T
+where
+    T: std::cmp::PartialOrd + Copy,
+{
+    if val < min {
+        min
+    } else if val > max {
+        max
+    } else {
+        val
     }
 }

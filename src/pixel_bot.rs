@@ -1,7 +1,6 @@
 use crate::config::{CfgKey, CfgValue, Config};
 use crate::coord::Coord;
 use crate::image::{Image, Pixel, PixelOrder};
-use crate::img_funcs::{color_range_avg_pos, crop_to_center};
 use crate::input::{find_mouse_dev, key_pressed, wait_for_release, InterceptionState};
 
 use rand::{self, Rng};
@@ -11,14 +10,15 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time;
 use std::time::Duration;
+use std::time::{self, Instant};
 
 const TARGET_COLOR: Pixel = Pixel {
     //cerise
     r: 196,
     g: 58,
     b: 172,
+    a: 255,
 };
 
 enum Message {
@@ -29,7 +29,7 @@ enum Message {
 pub struct PixelBot {
     config: Arc<RwLock<Config>>,
     handles: Vec<JoinHandle<()>>,
-    main_thread_sender: Option<mpsc::Sender<Message>>,
+    aim_thread_sender: Option<mpsc::Sender<Message>>,
     click_thread_sender: Option<mpsc::Sender<Message>>,
     mouse_dev: i32,
 }
@@ -45,28 +45,28 @@ impl PixelBot {
         Self {
             config,
             handles: Vec::new(),
-            mouse_dev: find_mouse_dev(),
-            main_thread_sender: None,
+            aim_thread_sender: None,
             click_thread_sender: None,
+            mouse_dev: find_mouse_dev(),
         }
     }
 
-    pub fn start(&mut self) -> Result<(), &'static str> {
-        if self.main_thread_sender.is_some() || self.click_thread_sender.is_some() {
+    pub fn start(&mut self, time_sender: mpsc::Sender<Duration>) -> Result<(), &'static str> {
+        if self.aim_thread_sender.is_some() || self.click_thread_sender.is_some() {
             return Err("Already started");
         }
         let (m_sx, m_rx) = mpsc::channel();
         let (c_sx, c_rx) = mpsc::channel();
-        self.main_thread_sender = Some(m_sx);
+        self.aim_thread_sender = Some(m_sx);
         self.click_thread_sender = Some(c_sx);
-        self.handles.push(self.spawn_main_thread(m_rx));
+        self.handles.push(self.spawn_aim_thread(m_rx, time_sender));
         self.handles.push(self.spawn_click_thread(c_rx));
         Ok(())
     }
 
     pub fn stop(&mut self) -> Result<(), &'static str> {
         const ERR_MSG: &str = "Already stopped";
-        self.main_thread_sender
+        self.aim_thread_sender
             .as_ref()
             .ok_or(ERR_MSG)?
             .send(Message::Stop)
@@ -84,7 +84,7 @@ impl PixelBot {
 
     pub fn reload(&self) -> Result<(), &'static str> {
         const ERR_MSG: &str = "Not Started";
-        self.main_thread_sender
+        self.aim_thread_sender
             .as_ref()
             .ok_or(ERR_MSG)?
             .send(Message::Reload)
@@ -97,7 +97,11 @@ impl PixelBot {
         Ok(())
     }
 
-    fn spawn_main_thread(&self, receiver: mpsc::Receiver<Message>) -> JoinHandle<()> {
+    fn spawn_aim_thread(
+        &self,
+        receiver: mpsc::Receiver<Message>,
+        time_sender: mpsc::Sender<Duration>,
+    ) -> JoinHandle<()> {
         let config = self.config.clone();
         let mouse_dev = self.mouse_dev;
 
@@ -124,7 +128,7 @@ impl PixelBot {
                 let toggle_key = cfg.get(CfgKey::ToggleAimKeycode).val;
                 drop(cfg);
 
-                // let mut last_cap = time::Instant::now();
+                let mut last_iter = Instant::now();
                 loop {
                     if let Ok(msg) = receiver.try_recv() {
                         match msg {
@@ -158,26 +162,19 @@ impl PixelBot {
                     };
 
                     // Crop image
-                    let cropped = crop_to_center(
-                        &Image::new(&(*buffer), PixelOrder::BGRA, screen_w, screen_h),
-                        crop_w as usize,
-                        crop_h as usize,
-                    );
+                    let buf_img = Image::new(&(*buffer), PixelOrder::BGRA, screen_w, screen_h);
+                    let cropped = buf_img.crop_to_center(crop_w as usize, crop_h as usize);
 
                     // Search through image and find avg position of the target color
-                    let mut relative_coord = match color_range_avg_pos(
-                        &cropped,
-                        TARGET_COLOR,
-                        color_thresh,
-                        y_divisor,
-                    ) {
-                        Some(coord) => Coord::new(
-                            // making coord relative to center
-                            coord.x as i32 - (cropped.w / 2) as i32,
-                            coord.y as i32 - (cropped.h / 2) as i32,
-                        ),
-                        None => Coord::new(0, 0),
-                    };
+                    let mut relative_coord =
+                        match cropped.color_range_avg_pos(TARGET_COLOR, color_thresh, y_divisor) {
+                            Some(coord) => Coord::new(
+                                // making coord relative to center
+                                coord.x as i32 - (cropped.w / 2) as i32,
+                                coord.y as i32 - (cropped.h / 2) as i32,
+                            ),
+                            None => Coord::new(0, 0),
+                        };
 
                     // scaling for sensitivity
                     relative_coord.x = (relative_coord.x as f32 / aim_divisor) as i32;
@@ -187,8 +184,8 @@ impl PixelBot {
                         interception.move_mouse_over_time(aim_dur, aim_steps, relative_coord);
                     }
 
-                    // println!("inbtwn frames: {:?}", last_cap.elapsed());
-                    // last_cap = time::Instant::now();
+                    time_sender.send(last_iter.elapsed()).unwrap();
+                    last_iter = Instant::now();
                 }
             }
         })
