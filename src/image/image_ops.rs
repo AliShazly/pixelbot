@@ -1,5 +1,5 @@
 use crate::coord::Coord;
-use crate::image::{get_1d_idx, get_2d_idx, Image, Pixel, PixelOrder, Subpx, N_SUBPX};
+use crate::image::{get_1d_idx, get_2d_idx, Image, Pixel, Subpx, SubpxOrder, N_SUBPX};
 
 use std::assert;
 use std::ops::{Deref, DerefMut, Index};
@@ -57,7 +57,7 @@ impl<T: Deref<Target = [Subpx]>> Image<T> {
 
         Image::new(
             out_buf,
-            PixelOrder::BGRA,
+            SubpxOrder::BGRA,
             self.w - (2 * crop_w),
             self.h - (2 * crop_h),
         )
@@ -107,14 +107,36 @@ impl<T: DerefMut<Target = [Subpx]>> Image<T> {
 
     pub fn draw_grid(&mut self, step: u32, fill: Pixel) {
         let img_w = self.w;
-        let idx2d = |idx: usize| (idx % img_w, idx / img_w);
         let pixel_order = self.pixel_order;
 
-        self.pixels_mut().enumerate().for_each(|(idx, mut px)| {
-            let (col, row) = idx2d(idx);
-            if row as u32 % step == 0 || col as u32 % step == 0 {
+        // ugly but 10x faster than the modulo version
+        let mut cur_col: u32 = 0;
+        let mut row_draw: u32 = 0;
+        let mut col_draw: u32 = 0;
+        self.pixels_mut().for_each(|mut px| {
+            if cur_col == img_w as u32 {
+                cur_col = 0;
+                col_draw = 0;
+
+                if row_draw == step {
+                    row_draw = 0;
+                } else {
+                    row_draw += 1;
+                }
+            }
+
+            if col_draw == step {
+                px.set(fill, pixel_order);
+                col_draw = 0;
+            } else {
+                col_draw += 1;
+            }
+
+            if row_draw == step {
                 px.set(fill, pixel_order);
             }
+
+            cur_col += 1;
         });
     }
 

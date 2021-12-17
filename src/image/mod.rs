@@ -5,20 +5,21 @@ use std::ops::{Deref, DerefMut, Sub};
 
 pub mod image_ops;
 
-const RGBA_ORDER: (usize, usize, usize, usize) = (0, 1, 2, 3);
-const BGRA_ORDER: (usize, usize, usize, usize) = (2, 1, 0, 3);
-pub const N_SUBPX: usize = 4;
 pub type Subpx = u8;
+pub const N_SUBPX: usize = 4;
+type SubpxIdxs = (usize, usize, usize, usize);
+const RGBA_ORDER: SubpxIdxs = (0, 1, 2, 3);
+const BGRA_ORDER: SubpxIdxs = (2, 1, 0, 3);
 
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Copy)]
-pub enum PixelOrder {
+pub enum SubpxOrder {
     RGBA,
     BGRA,
 }
 
-impl PixelOrder {
-    pub fn ordering(&self) -> (usize, usize, usize, usize) {
+impl SubpxOrder {
+    fn idxs(&self) -> SubpxIdxs {
         match *self {
             Self::RGBA => RGBA_ORDER,
             Self::BGRA => BGRA_ORDER,
@@ -39,10 +40,10 @@ impl Pixel {
         Self { r, g, b, a }
     }
 
-    pub fn from_slice(slice: &[Subpx], pixel_order: PixelOrder) -> Self {
+    pub fn from_slice(slice: &[Subpx], pixel_order: SubpxIdxs) -> Self {
         assert!(slice.len() >= N_SUBPX);
 
-        let (r_idx, g_idx, b_idx, a_idx) = pixel_order.ordering();
+        let (r_idx, g_idx, b_idx, a_idx) = pixel_order;
         Self::new(slice[r_idx], slice[g_idx], slice[b_idx], slice[a_idx])
     }
 
@@ -67,8 +68,8 @@ impl<'a> DerefMut for PixelMut<'a> {
 }
 
 impl<'a> PixelMut<'a> {
-    pub fn set(&mut self, px: Pixel, self_order: PixelOrder) {
-        let (r_idx, g_idx, b_idx, a_idx) = self_order.ordering();
+    pub fn set(&mut self, px: Pixel, self_order: SubpxIdxs) {
+        let (r_idx, g_idx, b_idx, a_idx) = self_order;
         self.0[r_idx] = px.r;
         self.0[g_idx] = px.g;
         self.0[b_idx] = px.b;
@@ -77,8 +78,8 @@ impl<'a> PixelMut<'a> {
     pub fn set_a(&mut self, alpha: Subpx) {
         self.0[N_SUBPX - 1] = alpha;
     }
-    pub fn as_pixel(&self, order: PixelOrder) -> Pixel {
-        let (r_idx, g_idx, b_idx, a_idx) = order.ordering();
+    pub fn as_pixel(&self, order: SubpxIdxs) -> Pixel {
+        let (r_idx, g_idx, b_idx, a_idx) = order;
         Pixel::new(self.0[r_idx], self.0[g_idx], self.0[b_idx], self.0[a_idx])
     }
 }
@@ -89,7 +90,7 @@ where
     T: Deref<Target = [Subpx]>,
 {
     buf: T,
-    pixel_order: PixelOrder,
+    pixel_order: SubpxIdxs,
     pub w: usize,
     pub h: usize,
 }
@@ -108,14 +109,14 @@ impl<T: DerefMut<Target = [Subpx]>> DerefMut for Image<T> {
 }
 
 impl<T: Deref<Target = [Subpx]>> Image<T> {
-    pub fn new(buf: T, pixel_order: PixelOrder, w: usize, h: usize) -> Self {
+    pub fn new(buf: T, pixel_order: SubpxOrder, w: usize, h: usize) -> Self {
         assert!(
             buf.len() == (w * h * N_SUBPX),
             "Image dims don't match buffer length"
         );
         Self {
             buf,
-            pixel_order,
+            pixel_order: pixel_order.idxs(),
             w,
             h,
         }

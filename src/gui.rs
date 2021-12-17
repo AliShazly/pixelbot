@@ -1,7 +1,7 @@
 use crate::config::{CfgKey, CfgValue, Config};
 use crate::coord::Coord;
 use crate::image::image_ops::{self, blend_fns};
-use crate::image::{Image, Pixel, PixelOrder, N_SUBPX};
+use crate::image::{Image, Pixel, SubpxOrder, N_SUBPX};
 
 use fltk::{
     app::{self, *},
@@ -58,7 +58,7 @@ impl Graph {
             points: VecDeque::new(),
             img: Image::new(
                 vec![0; b.w as usize * b.h as usize * N_SUBPX],
-                PixelOrder::RGBA,
+                SubpxOrder::RGBA,
                 b.w as usize,
                 b.h as usize,
             ),
@@ -194,9 +194,9 @@ impl Gui {
             graph_range_ms,
         );
         let graph_buf = vec![0u8; b.h as usize * b.w as usize * N_SUBPX];
-        let mut graph_img = Image::new(graph_buf, PixelOrder::RGBA, b.w as usize, b.h as usize);
+        let mut graph_img = Image::new(graph_buf, SubpxOrder::RGBA, b.w as usize, b.h as usize);
         let bg_buf = vec![0u8; b.h as usize * b.w as usize * N_SUBPX];
-        let mut bg_img = Image::new(bg_buf, PixelOrder::RGBA, b.w as usize, b.h as usize);
+        let mut bg_img = Image::new(bg_buf, SubpxOrder::RGBA, b.w as usize, b.h as usize);
         bg_img.fill_color(Pixel::new(0, 0, 255, 255));
         bg_img.draw_grid(30, Pixel::new(0, 255, 0, 255));
         app::add_idle(move || {
