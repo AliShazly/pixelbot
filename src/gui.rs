@@ -1,7 +1,6 @@
 use crate::config::{CfgKey, CfgValue, Config};
 use crate::coord::Coord;
-use crate::image::image_ops::{self, blend_fns};
-use crate::image::{Image, Pixel, SubpxOrder, N_SUBPX};
+use crate::image::{self, image_ops::BlendType, Rgba8, Subpixel};
 
 use fltk::{
     app::{self, *},
@@ -11,7 +10,6 @@ use fltk::{
     group::*,
     prelude::*,
     valuator::*,
-    widget::*,
     window::*,
 };
 use std::assert;
@@ -45,7 +43,7 @@ struct Graph {
     receiver: mpsc::Receiver<Duration>,
     data_range: Range<i32>,
     points: VecDeque<Coord<i32>>,
-    img: Image<Vec<u8>>,
+    img: image::Image<Vec<<Rgba8 as Subpixel>::Inner>, Rgba8>,
     current_time: Instant,
 }
 
@@ -56,9 +54,8 @@ impl Graph {
             receiver,
             data_range,
             points: VecDeque::new(),
-            img: Image::new(
-                vec![0; b.w as usize * b.h as usize * N_SUBPX],
-                SubpxOrder::RGBA,
+            img: image::Image::new(
+                vec![0; b.w as usize * b.h as usize * Rgba8::N_SUBPX],
                 b.w as usize,
                 b.h as usize,
             ),
@@ -66,7 +63,7 @@ impl Graph {
         }
     }
 
-    pub fn tick(&mut self) -> Option<Vec<Coord<i32>>> {
+    pub fn tick(&mut self) -> Option<(Vec<Coord<i32>>, Duration)> {
         const INC: i32 = 1;
         const TICK_FREQ: Duration = Duration::from_millis(1);
 
@@ -89,7 +86,7 @@ impl Graph {
                 self.points.pop_front();
             };
             self.current_time = Instant::now();
-            Some(self.points.iter().copied().collect())
+            Some((self.points.iter().copied().collect(), time))
         } else {
             None
         }
@@ -185,29 +182,44 @@ impl Gui {
         b: Bounds,
         receiver: mpsc::Receiver<Duration>,
         graph_range_ms: Range<i32>,
-        color: Pixel,
+        color: image::Color<u8>,
     ) {
+        const LABEL_SIZE_DIVISOR: i32 = 15;
         let mut frm = Frame::default().with_pos(b.x, b.y).with_size(b.w, b.h);
+        let mut label_frame = Frame::new(b.x, b.y + b.h, b.w, b.h / (LABEL_SIZE_DIVISOR / 2), "")
+            .with_label("ayooooo")
+            .with_align(Align::LeftBottom | Align::Inside);
+        label_frame.set_label_font(Font::HelveticaBold);
+        label_frame.set_label_size(b.h / LABEL_SIZE_DIVISOR);
+        label_frame.set_frame(FrameType::FlatBox);
+        label_frame.set_color(Color::Green);
+
         let mut graph = Graph::new(
             Bounds::new(frm.x(), frm.y(), frm.w(), frm.h()),
             receiver,
             graph_range_ms,
         );
-        let graph_buf = vec![0u8; b.h as usize * b.w as usize * N_SUBPX];
-        let mut graph_img = Image::new(graph_buf, SubpxOrder::RGBA, b.w as usize, b.h as usize);
-        let bg_buf = vec![0u8; b.h as usize * b.w as usize * N_SUBPX];
-        let mut bg_img = Image::new(bg_buf, SubpxOrder::RGBA, b.w as usize, b.h as usize);
-        bg_img.fill_color(Pixel::new(0, 0, 255, 255));
-        bg_img.draw_grid(30, Pixel::new(0, 255, 0, 255));
+
+        let buf_size = b.w as usize * b.h as usize * Rgba8::N_SUBPX;
+        let mut graph_img: image::Image<_, Rgba8> =
+            image::Image::new(vec![0u8; buf_size], b.w as usize, b.h as usize);
+        let mut bg_img: image::Image<_, Rgba8> =
+            image::Image::new(vec![0u8; buf_size], b.w as usize, b.h as usize);
+
+        bg_img.fill_color(image::Color::new(0, 0, 255, 255));
+        bg_img.draw_grid(30, image::Color::new(0, 255, 0, 255));
+
         app::add_idle(move || {
-            if let Some(coords) = graph.tick() {
+            if let Some((coords, time)) = graph.tick() {
+                label_frame.set_label(format!("{:?}", time).as_str());
+                label_frame.redraw_label();
                 frm.redraw();
                 coords.windows(2).for_each(|coords| {
                     let p1 = coords[0];
                     let p2 = coords[1];
                     graph_img.draw_line(Coord::new(p1.y, p1.x), Coord::new(p2.y, p2.x), color);
                 });
-                graph_img.blend(blend_fns::over, &bg_img);
+                graph_img.blend(BlendType::Over, &bg_img);
                 draw_rgba(&mut frm, graph_img.as_slice()).unwrap();
                 graph_img.fill_zeroes();
             }
@@ -225,8 +237,10 @@ impl Gui {
     ) -> HorFillSlider {
         let mut slider = HorFillSlider::new(x, y, w, h, "");
         let mut label_frame = Frame::new(x, y, w, h, "").with_label(label);
+        const LABEL_SIZE_DIVISOR: f32 = 2.8;
         label_frame.set_label_font(Font::HelveticaBold);
-        label_frame.set_label_size((h as f32 / 2.7) as i32);
+        label_frame.set_label_size((h as f32 / LABEL_SIZE_DIVISOR) as i32);
+
         slider.set_color(Color::Dark2);
         slider.set_slider_frame(FrameType::EmbossedBox);
 
@@ -237,8 +251,7 @@ impl Gui {
         slider.set_precision(2);
 
         // To make sure the slider label is always drawn on top of the slider
-        slider.draw(move |s| {
-            s.redraw();
+        slider.draw(move |_| {
             label_frame.redraw_label();
         });
 
@@ -319,6 +332,12 @@ impl Gui {
     }
 
     pub fn init(&mut self) {
+        // app::background(0, 0, 0); // background color. For input/output and text widgets, use app::background2
+        // app::foreground(20, 20, 20); // labels
+        // app::set_font(Font::Courier);
+        // app::set_font_size(16);
+        // app::set_frame_type(FrameType::RFlatBox);
+
         self.window.end();
         self.window.show();
         for init_fn in self.init_fns.iter() {

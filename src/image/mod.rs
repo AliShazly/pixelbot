@@ -1,191 +1,173 @@
-extern crate line_drawing;
+use num::Zero;
+
 use crate::coord::Coord;
 use std::assert;
-use std::ops::{Deref, DerefMut, Sub};
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 
+mod blend;
 pub mod image_ops;
 
-pub type Subpx = u8;
-pub const N_SUBPX: usize = 4;
-type SubpxIdxs = (usize, usize, usize, usize);
-const RGBA_ORDER: SubpxIdxs = (0, 1, 2, 3);
-const BGRA_ORDER: SubpxIdxs = (2, 1, 0, 3);
-
-#[allow(clippy::upper_case_acronyms)]
-#[derive(Debug, Clone, Copy)]
-pub enum SubpxOrder {
-    RGBA,
-    BGRA,
+pub struct SubpxOrder {
+    r: usize,
+    g: usize,
+    b: usize,
+    a: usize,
 }
-
-impl SubpxOrder {
-    fn idxs(&self) -> SubpxIdxs {
-        match *self {
-            Self::RGBA => RGBA_ORDER,
-            Self::BGRA => BGRA_ORDER,
-        }
-    }
-}
+const RGBA_ORDER: SubpxOrder = SubpxOrder { r: 0, g: 1, b: 2, a: 3 };
+const BGRA_ORDER: SubpxOrder = SubpxOrder { r: 2, g: 1, b: 0, a: 3 };
 
 #[derive(Debug, Clone, Copy)]
-pub struct Pixel {
-    pub r: Subpx,
-    pub g: Subpx,
-    pub b: Subpx,
-    pub a: Subpx,
+pub struct Color<T> {
+    pub r: T,
+    pub g: T,
+    pub b: T,
+    pub a: T,
 }
-
-impl Pixel {
-    pub fn new(r: Subpx, g: Subpx, b: Subpx, a: Subpx) -> Self {
+impl<T: Copy> Color<T> {
+    pub fn new(r: T, g: T, b: T, a: T) -> Self {
         Self { r, g, b, a }
     }
+}
 
-    pub fn from_slice(slice: &[Subpx], pixel_order: SubpxIdxs) -> Self {
-        assert!(slice.len() >= N_SUBPX);
+pub trait Subpixel {
+    type Inner: Copy + Zero;
 
-        let (r_idx, g_idx, b_idx, a_idx) = pixel_order;
-        Self::new(slice[r_idx], slice[g_idx], slice[b_idx], slice[a_idx])
+    const ORDER: SubpxOrder;
+    const N_SUBPX: usize;
+}
+
+pub trait Pixel<T: Subpixel>
+where
+    Self: AsRef<[T::Inner]>,
+{
+    fn rgba(&self) -> [T::Inner; 4] {
+        [
+            self.as_ref()[T::ORDER.r],
+            self.as_ref()[T::ORDER.g],
+            self.as_ref()[T::ORDER.b],
+            self.as_ref()[T::ORDER.a],
+        ]
     }
-
-    pub fn packed(&self) -> u32 {
-        let (r, g, b) = (self.r as u32, self.g as u32, self.b as u32);
-        (r << 16) | (g << 8) | b
+    fn as_color(&self) -> Color<T::Inner> {
+        let [r, g, b, a] = self.rgba();
+        Color::new(r, g, b, a)
     }
 }
 
-pub struct PixelMut<'a>(&'a mut [Subpx]);
-
-impl<'a> Deref for PixelMut<'a> {
-    type Target = [Subpx];
-    fn deref(&self) -> &Self::Target {
-        self.0
-    }
-}
-impl<'a> DerefMut for PixelMut<'a> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0
-    }
+pub trait PixelMut<T: Subpixel>: Pixel<T> {
+    fn set(&mut self, fill: Color<T::Inner>);
+    fn set_a(&mut self, alpha: T::Inner);
 }
 
-impl<'a> PixelMut<'a> {
-    pub fn set(&mut self, px: Pixel, self_order: SubpxIdxs) {
-        let (r_idx, g_idx, b_idx, a_idx) = self_order;
-        self.0[r_idx] = px.r;
-        self.0[g_idx] = px.g;
-        self.0[b_idx] = px.b;
-        self.0[a_idx] = px.a;
+impl<T: Subpixel> Pixel<T> for &[T::Inner] {}
+impl<T: Subpixel> Pixel<T> for &mut [T::Inner] {}
+impl<T: Subpixel> PixelMut<T> for &mut [T::Inner] {
+    fn set(&mut self, fill: Color<T::Inner>) {
+        self[T::ORDER.r] = fill.r;
+        self[T::ORDER.g] = fill.g;
+        self[T::ORDER.b] = fill.b;
+        self[T::ORDER.a] = fill.a;
     }
-    pub fn set_a(&mut self, alpha: Subpx) {
-        self.0[N_SUBPX - 1] = alpha;
-    }
-    pub fn as_pixel(&self, order: SubpxIdxs) -> Pixel {
-        let (r_idx, g_idx, b_idx, a_idx) = order;
-        Pixel::new(self.0[r_idx], self.0[g_idx], self.0[b_idx], self.0[a_idx])
+    fn set_a(&mut self, alpha: T::Inner) {
+        self[T::ORDER.a] = alpha;
     }
 }
+
+macro_rules! define_subpx {
+    ($name:ident, $typ:ty, $order: expr, $n_subpx: expr) => {
+        pub enum $name {}
+
+        impl Subpixel for $name {
+            type Inner = $typ;
+            const ORDER: SubpxOrder = $order;
+            const N_SUBPX: usize = $n_subpx;
+        }
+    };
+}
+
+define_subpx!(Rgba8, u8, RGBA_ORDER, 4);
+define_subpx!(Bgra8, u8, BGRA_ORDER, 4);
 
 #[derive(Debug)]
-pub struct Image<T>
-where
-    T: Deref<Target = [Subpx]>,
-{
+pub struct Image<T, S> {
     buf: T,
-    pixel_order: SubpxIdxs,
     pub w: usize,
     pub h: usize,
+    _marker: PhantomData<fn() -> S>,
 }
 
-impl<T: Deref<Target = [Subpx]>> Deref for Image<T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        &self.buf
-    }
-}
-
-impl<T: DerefMut<Target = [Subpx]>> DerefMut for Image<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.buf
-    }
-}
-
-impl<T: Deref<Target = [Subpx]>> Image<T> {
-    pub fn new(buf: T, pixel_order: SubpxOrder, w: usize, h: usize) -> Self {
+impl<T, S> Image<T, S>
+where
+    T: Deref<Target = [S::Inner]>,
+    S: Subpixel,
+{
+    pub fn new(buf: T, w: usize, h: usize) -> Self {
         assert!(
-            buf.len() == (w * h * N_SUBPX),
+            buf.len() == (w * h * S::N_SUBPX),
             "Image dims don't match buffer length"
         );
         Self {
             buf,
-            pixel_order: pixel_order.idxs(),
             w,
             h,
+            _marker: PhantomData,
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Subpx> {
+    pub fn iter(&self) -> impl Iterator<Item = &S::Inner> {
         self.buf.iter()
     }
 
-    pub fn pixels(&self) -> impl Iterator<Item = Pixel> + '_ {
-        self.buf
-            .chunks_exact(N_SUBPX)
-            .map(|slice| Pixel::from_slice(slice, self.pixel_order))
+    pub fn pixels(&self) -> impl Iterator<Item = impl Pixel<S> + '_> {
+        self.buf.chunks_exact(S::N_SUBPX)
     }
 
-    pub fn rows(&self) -> impl Iterator<Item = &[Subpx]> {
-        self.buf.chunks_exact(self.w * N_SUBPX)
+    // maybe double split into chunks of pixels
+    pub fn rows(&self) -> impl Iterator<Item = &[S::Inner]> {
+        self.buf.chunks_exact(self.w * S::N_SUBPX)
     }
 
     // Takes pixel idx.
     //     eg. idx=1 -> 2nd pixel, not 2nd subpx
-    pub fn get_pixel(&self, pixel_idx: usize) -> Pixel {
-        let buf_idx: usize = pixel_idx * N_SUBPX;
-        Pixel::from_slice(&self.buf[buf_idx..buf_idx + N_SUBPX], self.pixel_order)
+    pub fn get_pixel(&self, pixel_idx: usize) -> impl Pixel<S> + '_ {
+        let buf_idx: usize = pixel_idx * S::N_SUBPX;
+        &self.buf[buf_idx..buf_idx + S::N_SUBPX]
     }
 
-    pub fn show(&self) {
-        let (w, h) = (self.w, self.h);
-        let buf_packed: Vec<u32> = (0..self.w * self.h)
-            .map(|idx| self.get_pixel(idx).packed())
-            .collect();
-        let mut window =
-            minifb::Window::new("Image", w, h, minifb::WindowOptions::default()).unwrap();
-        window.limit_update_rate(Some(std::time::Duration::from_micros(16600)));
-        while window.is_open() && !window.is_key_down(minifb::Key::Escape) {
-            // window.set_position(-1920, 0);
-            window.update_with_buffer(&buf_packed, w, h).unwrap();
-        }
+    pub fn as_slice(&self) -> &[S::Inner] {
+        &self.buf[..]
     }
 }
 
-impl<T: DerefMut<Target = [Subpx]>> Image<T> {
-    pub fn pixels_mut(&mut self) -> impl Iterator<Item = PixelMut> + '_ {
-        self.buf
-            .chunks_exact_mut(N_SUBPX)
-            .map(|slice| PixelMut(slice))
+impl<T, S> Image<T, S>
+where
+    T: DerefMut<Target = [S::Inner]>,
+    S: Subpixel,
+{
+    pub fn pixels_mut(&mut self) -> impl Iterator<Item = impl PixelMut<S> + '_> {
+        self.buf.chunks_exact_mut(S::N_SUBPX)
     }
 
-    pub fn get_pixel_mut(&mut self, pixel_idx: usize) -> PixelMut {
-        let buf_idx: usize = pixel_idx * N_SUBPX;
-        PixelMut(&mut self.buf[buf_idx..buf_idx + N_SUBPX])
+    pub fn get_pixel_mut(&mut self, pixel_idx: usize) -> impl PixelMut<S> + '_ {
+        let buf_idx: usize = pixel_idx * S::N_SUBPX;
+        &mut self.buf[buf_idx..buf_idx + S::N_SUBPX]
     }
 
     pub fn fill_zeroes(&mut self) {
-        self.buf.fill(0);
+        self.buf.fill(num::zero());
     }
 
-    pub fn fill_alpha(&mut self, alpha: Subpx) {
+    pub fn fill_color(&mut self, color: Color<S::Inner>) {
         self.pixels_mut().for_each(|mut px| {
-            px.set_a(alpha);
+            px.set(color);
         });
     }
+}
 
-    pub fn fill_color(&mut self, color: Pixel) {
-        let order = self.pixel_order;
-        self.pixels_mut().for_each(|mut px| {
-            px.set(color, order);
-        });
-    }
+pub fn pack_rgb(r: u8, g: u8, b: u8) -> u32 {
+    let (r, g, b) = (r as u32, g as u32, b as u32);
+    (r << 16) | (g << 8) | b
 }
 
 fn get_2d_idx(width: usize, idx: usize) -> Coord<usize> {

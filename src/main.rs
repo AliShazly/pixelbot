@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-#![allow(unused_imports)]
 
 mod config;
 mod coord;
@@ -10,13 +9,16 @@ mod pixel_bot;
 
 use config::{CfgKey, CfgValue, Config};
 use gui::{Bounds, Gui, Message};
-use image::Pixel;
+use image::Color;
 use pixel_bot::PixelBot;
-use rand::Rng;
 use std::panic;
 use std::sync::{mpsc, Arc, RwLock};
+use std::thread;
+use std::time::Duration;
 
-use windows::Win32::UI::HiDpi::{SetProcessDpiAwareness, PROCESS_PER_MONITOR_DPI_AWARE};
+use windows::Win32::UI::HiDpi::{
+    SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 
 // Kills the entire process if one thread panics
 fn set_panic_hook() {
@@ -29,7 +31,7 @@ fn set_panic_hook() {
 
 fn main() {
     set_panic_hook();
-    unsafe { SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE).unwrap() };
+    unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 
     let config = Arc::new(RwLock::new(Config::from_file().unwrap()));
 
@@ -73,14 +75,15 @@ fn main() {
         0.1,
     );
     gui.create_graph(
-        Bounds::new(500, 500, 300, 100),
+        Bounds::new(300, 300, 600, 300),
         graph_receiver,
         5..50,
-        Pixel::new(255, 0, 0, 255),
+        Color::new(255, 0, 0, 255),
     );
     gui.init();
 
     while gui.wait() {
+        thread::sleep(Duration::from_millis(1)); //TODO: instead of a sleep here, remove the app::add_idle and make an event that trips when graph data is ready
         if let Ok(msg) = gui_receiver.try_recv() {
             match msg {
                 Message::ChangedConfig => {

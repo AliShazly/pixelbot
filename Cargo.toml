@@ -11,11 +11,23 @@ minifb = "0.20"
 interception = "0.1.2"
 rand = "0.8.4"
 fltk = "^1.2"
-num_enum = "0.5.4"
 num = "0.4.0"
+num-traits = "0.2.14"
+num-derive = "0.3.3"
 spin_sleep = "1.0.0" 
 line_drawing = "1.0.0"
 
 [dependencies.windows]
 version = "0.28.0"
 features = ["Win32_UI_Input_KeyboardAndMouse","Win32_UI_HiDpi"]
+
+[profile.release]
+debug = true
+# lto = true
+
+[dev-dependencies]
+criterion = "0.3"
+
+[[bench]]
+name = "bench"
+harness = false

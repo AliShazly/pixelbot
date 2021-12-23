@@ -1,19 +1,17 @@
-use crate::config::{CfgKey, CfgValue, Config};
+use crate::config::{CfgKey, Config};
 use crate::coord::Coord;
-use crate::image::{Image, Pixel, SubpxOrder};
+use crate::image::{Bgra8, Color, Image};
 use crate::input::{find_mouse_dev, key_pressed, wait_for_release, InterceptionState};
 
 use rand::{self, Rng};
 use std::io::ErrorKind::WouldBlock;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use std::time::{self, Instant};
+use std::time::Instant;
 
-const TARGET_COLOR: Pixel = Pixel {
+const TARGET_COLOR: Color<u8> = Color {
     //cerise
     r: 196,
     g: 58,
@@ -162,7 +160,7 @@ impl PixelBot {
                     };
 
                     // Crop image
-                    let buf_img = Image::new(&(*buffer), SubpxOrder::BGRA, screen_w, screen_h);
+                    let buf_img: Image<_, Bgra8> = Image::new(&(*buffer), screen_w, screen_h);
                     let cropped = buf_img.crop_to_center(crop_w as usize, crop_h as usize);
 
                     // Search through image and find avg position of the target color

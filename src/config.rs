@@ -1,14 +1,12 @@
-extern crate num;
-use num_enum::TryFromPrimitive;
+use num_derive::FromPrimitive;
 use std::collections::HashMap;
-use std::convert::TryFrom;
 use std::fmt;
 use std::fmt::Display;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::BufReader;
 use std::io::Write;
-use std::ops::{Range, RangeInclusive};
+use std::ops::Range;
 
 const CFG_FILE_PATH: &str = "./config.cfg";
 
@@ -31,10 +29,9 @@ impl fmt::Display for ReadError {
 
 impl std::error::Error for ReadError {}
 
-#[derive(Debug, Hash, PartialEq, Eq, TryFromPrimitive, Clone, Copy)]
-#[repr(usize)]
+#[derive(Debug, Hash, PartialEq, Eq, FromPrimitive, Clone, Copy)]
 pub enum CfgKey {
-    CropW,
+    CropW = 0,
     CropH,
     ColorThresh,
     AimDivisor,
@@ -53,9 +50,9 @@ pub enum CfgKey {
 const N_CONFIG_ITEMS: usize = CfgKey::_Size as usize;
 
 impl CfgKey {
-    // Uses TryFromPrimitive to convert integer into variant of cfgkey struct
+    // Uses FromPrimitive to convert integer into variant of cfgkey struct
     fn iter() -> impl Iterator<Item = Self> {
-        (0..N_CONFIG_ITEMS).map(|i| Self::try_from(i).unwrap())
+        (0..N_CONFIG_ITEMS).map(|i| num::FromPrimitive::from_usize(i).unwrap())
     }
 
     fn default_val(&self) -> ValType {
@@ -283,7 +280,7 @@ fn camel_to_snake(camel_str: &str) -> String {
         .filter(|(_, char)| char.is_uppercase())
         .for_each(|(idx, _)| {
             snake_str.insert(idx + insert_offset, '_');
-            insert_offset += 1
+            insert_offset += 1;
         });
     snake_str
 }
