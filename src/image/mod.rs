@@ -1,4 +1,5 @@
 use num::Zero;
+use num_traits::AsPrimitive;
 
 use crate::coord::Coord;
 use std::assert;
@@ -31,7 +32,7 @@ impl<T: Copy> Color<T> {
 }
 
 pub trait Subpixel {
-    type Inner: Copy + Zero;
+    type Inner: Copy + Zero + AsPrimitive<Self::Inner> + 'static;
 
     const ORDER: SubpxOrder;
     const N_SUBPX: usize;
@@ -56,21 +57,17 @@ where
 }
 
 pub trait PixelMut<T: Subpixel>: Pixel<T> {
-    fn set(&mut self, fill: Color<T::Inner>);
-    fn set_a(&mut self, alpha: T::Inner);
+    fn set<U: AsPrimitive<T::Inner>>(&mut self, fill: Color<U>);
 }
 
 impl<T: Subpixel> Pixel<T> for &[T::Inner] {}
 impl<T: Subpixel> Pixel<T> for &mut [T::Inner] {}
 impl<T: Subpixel> PixelMut<T> for &mut [T::Inner] {
-    fn set(&mut self, fill: Color<T::Inner>) {
-        self[T::ORDER.r] = fill.r;
-        self[T::ORDER.g] = fill.g;
-        self[T::ORDER.b] = fill.b;
-        self[T::ORDER.a] = fill.a;
-    }
-    fn set_a(&mut self, alpha: T::Inner) {
-        self[T::ORDER.a] = alpha;
+    fn set<U: AsPrimitive<T::Inner>>(&mut self, fill: Color<U>) {
+        self[T::ORDER.r] = fill.r.as_();
+        self[T::ORDER.g] = fill.g.as_();
+        self[T::ORDER.b] = fill.b.as_();
+        self[T::ORDER.a] = fill.a.as_();
     }
 }
 
@@ -89,7 +86,7 @@ macro_rules! define_subpx {
 define_subpx!(Rgba8, u8, RGBA_ORDER, 4);
 define_subpx!(Bgra8, u8, BGRA_ORDER, 4);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Image<T, S> {
     buf: T,
     pub w: usize,
@@ -115,15 +112,14 @@ where
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &S::Inner> {
-        self.buf.iter()
+    pub fn zeroed(w: usize, h: usize) -> Image<Vec<S::Inner>, S> {
+        Image::new(vec![num::zero(); w * h * S::N_SUBPX], w, h)
     }
 
     pub fn pixels(&self) -> impl Iterator<Item = impl Pixel<S> + '_> {
         self.buf.chunks_exact(S::N_SUBPX)
     }
 
-    // maybe double split into chunks of pixels
     pub fn rows(&self) -> impl Iterator<Item = &[S::Inner]> {
         self.buf.chunks_exact(self.w * S::N_SUBPX)
     }
@@ -133,6 +129,11 @@ where
     pub fn get_pixel(&self, pixel_idx: usize) -> impl Pixel<S> + '_ {
         let buf_idx: usize = pixel_idx * S::N_SUBPX;
         &self.buf[buf_idx..buf_idx + S::N_SUBPX]
+    }
+
+    pub fn get_pixel2d(&self, pos: Coord<usize>) -> impl Pixel<S> + '_ {
+        let idx = get_1d_idx(self.w, pos.y, pos.x);
+        self.get_pixel(idx)
     }
 
     pub fn as_slice(&self) -> &[S::Inner] {
@@ -149,9 +150,18 @@ where
         self.buf.chunks_exact_mut(S::N_SUBPX)
     }
 
-    pub fn get_pixel_mut(&mut self, pixel_idx: usize) -> impl PixelMut<S> + '_ {
+    pub fn set(&mut self, pixel_idx: usize, fill: Color<S::Inner>) {
         let buf_idx: usize = pixel_idx * S::N_SUBPX;
-        &mut self.buf[buf_idx..buf_idx + S::N_SUBPX]
+        PixelMut::<S>::set(&mut &mut self.buf[buf_idx..buf_idx + S::N_SUBPX], fill);
+    }
+
+    pub fn set2d(&mut self, pos: Coord<usize>, fill: Color<S::Inner>) {
+        let idx = get_1d_idx(self.w, pos.y, pos.x);
+        self.set(idx, fill);
+    }
+
+    pub fn rows_mut(&mut self) -> impl Iterator<Item = &mut [S::Inner]> {
+        self.buf.chunks_exact_mut(self.w * S::N_SUBPX)
     }
 
     pub fn fill_zeroes(&mut self) {
@@ -162,6 +172,18 @@ where
         self.pixels_mut().for_each(|mut px| {
             px.set(color);
         });
+    }
+}
+
+// #[derive(clone)] doesnt work
+impl<T, S> Image<T, S>
+where
+    T: Deref<Target = [S::Inner]> + Clone,
+    S: Subpixel,
+{
+    #[must_use]
+    pub fn _clone(&self) -> Self {
+        Self::new(self.buf.clone(), self.w, self.h)
     }
 }
 

@@ -1,7 +1,7 @@
 extern crate line_drawing;
 use crate::coord::Coord;
 use crate::image::blend::{avx_blend_over, avx_blend_under, over, under};
-use crate::image::{get_1d_idx, get_2d_idx, pack_rgb, Color, Image, Pixel, PixelMut, Subpixel};
+use crate::image::{get_2d_idx, pack_rgb, Color, Image, Pixel, PixelMut, Subpixel};
 
 use std::assert;
 use std::ops::{Deref, DerefMut, Index};
@@ -21,15 +21,15 @@ where
 
         let w_subpx = self.w * S::N_SUBPX;
         let crop_w_subpx = crop_w * S::N_SUBPX;
-        let row_range = crop_w_subpx..(w_subpx - crop_w_subpx);
-        let col_range = crop_h..(self.h - crop_h);
+        let col_range = crop_w_subpx..(w_subpx - crop_w_subpx);
+        let row_range = crop_h..(self.h - crop_h);
 
         let mut out_buf: Vec<S::Inner> = Vec::new();
         self.rows()
             .enumerate()
             .filter_map(|(idx, row)| {
-                if col_range.contains(&idx) {
-                    Some(row.index(row_range.clone()))
+                if row_range.contains(&idx) {
+                    Some(row.index(col_range.clone()))
                 } else {
                     None
                 }
@@ -38,6 +38,34 @@ where
 
         Image::new(out_buf, self.w - (2 * crop_w), self.h - (2 * crop_h))
     }
+
+    pub fn scale_nearest(&self, new_w: usize, new_h: usize) -> Image<Vec<S::Inner>, S> {
+        assert!(new_w > 0 && new_h > 0);
+
+        let mut out = Image::<Vec<_>, _>::zeroed(new_w, new_h);
+        for x in 0..new_w {
+            for y in 0..new_h {
+                let src_x =
+                    (self.w - 1).min((x as f32 / new_w as f32 * self.w as f32).round() as usize);
+                let src_y =
+                    (self.h - 1).min((y as f32 / new_h as f32 * self.h as f32).round() as usize);
+
+                out.set2d(
+                    Coord::new(x, y),
+                    self.get_pixel2d(Coord::new(src_x, src_y)).as_color(),
+                );
+            }
+        }
+        out
+    }
+
+    pub fn scale_keep_aspect(&self, new_w: usize, new_h: usize) -> Image<Vec<S::Inner>, S> {
+        let ratio = (new_w as f32 / self.w as f32).min(new_h as f32 / self.h as f32);
+        self.scale_nearest(
+            ((self.w as f32 * ratio) as usize).max(1),
+            ((self.h as f32 * ratio) as usize).max(1),
+        )
+    }
 }
 
 impl<T, S> Image<T, S>
@@ -45,10 +73,37 @@ where
     T: DerefMut<Target = [S::Inner]>,
     S: Subpixel,
 {
-    pub fn draw_line(&mut self, start: Coord<i32>, end: Coord<i32>, fill: Color<S::Inner>) {
-        for (x, y) in line_drawing::WalkGrid::new((start.x, start.y), (end.x, end.y)) {
-            let idx = get_1d_idx(self.w, x as usize, y as usize);
-            self.get_pixel_mut(idx).set(fill);
+    pub fn draw_line(&mut self, start: Coord<usize>, end: Coord<usize>, fill: Color<S::Inner>) {
+        line_drawing::Bresenham::new(
+            (start.x as i32, start.y as i32),
+            (end.x as i32, end.y as i32),
+        )
+        .for_each(|(x, y)| self.set2d(Coord::new(x as usize, y as usize), fill))
+    }
+
+    pub fn draw_bbox(&mut self, tl: Coord<usize>, w: usize, h: usize, fill: Color<S::Inner>) {
+        let tr = Coord::new(tl.x + w, tl.y);
+        let bl = Coord::new(tl.x, tl.y + h);
+        let br = Coord::new(bl.x + w, bl.y);
+        self.draw_line(tl, tr, fill);
+        self.draw_line(tr, br, fill);
+        self.draw_line(br, bl, fill);
+        self.draw_line(bl, tl, fill);
+    }
+
+    pub fn draw_crosshair(&mut self, pos: Coord<usize>, len: usize, fill: Color<S::Inner>) {
+        assert!((0..self.w).contains(&pos.x) && (0..self.h).contains(&pos.y));
+
+        let x_range =
+            (pos.x as i32 - len as i32).max(0) as usize..=(pos.x + len).min(self.w - 1) as usize;
+        let y_range =
+            (pos.y as i32 - len as i32).max(0) as usize..=(pos.y + len).min(self.h - 1) as usize;
+
+        for x_idx in x_range {
+            self.set2d(Coord::new(x_idx, pos.y), fill);
+        }
+        for y_idx in y_range {
+            self.set2d(Coord::new(pos.x, y_idx), fill);
         }
     }
 
@@ -83,6 +138,33 @@ where
             }
 
             cur_col += 1;
+        });
+    }
+
+    pub fn layer_image_over<U, V>(&mut self, other_img: &Image<U, V>)
+    where
+        U: DerefMut<Target = [V::Inner]>,
+        V: Subpixel<Inner = S::Inner>,
+    {
+        assert!(other_img.w <= self.w && other_img.h <= self.h && V::N_SUBPX == S::N_SUBPX,);
+
+        let col_skip = (self.w - other_img.w) / 2;
+        let y_center_start = (self.h - other_img.h) / 2;
+        let row_range = y_center_start..y_center_start + other_img.h;
+
+        let mut other_img_rows = other_img.rows();
+        self.rows_mut().enumerate().for_each(|(idx, row)| {
+            if row_range.contains(&idx) {
+                let mut other_row = other_img_rows.next().unwrap().chunks_exact(V::N_SUBPX);
+                for mut px_slice in row
+                    .chunks_exact_mut(S::N_SUBPX)
+                    .skip(col_skip)
+                    .take(other_img.w)
+                {
+                    let other_color = Pixel::<V>::as_color(&other_row.next().unwrap());
+                    PixelMut::<S>::set(&mut px_slice, other_color);
+                }
+            }
         });
     }
 }
@@ -125,33 +207,22 @@ where
         }
     }
 
-    pub fn color_range_avg_pos(
-        &self,
-        target: Color<S::Inner>,
-        thresh: f32,
-        y_divisor: f32, // Divides Y to bias aim towards head
-    ) -> Option<Coord<usize>> {
+    pub fn detect_color(&self, target: Color<S::Inner>, thresh: f32) -> Option<Vec<Coord<usize>>> {
         assert!(thresh > 0. && thresh < 1.);
 
-        let mut count: u32 = 0;
-        let mut coord_sum = Coord::new(0, 0);
-
+        let mut coords: Vec<Coord<usize>> = Vec::new();
         self.pixels()
             .map(|px| 1. - color_distance(px.as_color(), target))
             .enumerate()
             .for_each(|(idx, dist)| {
                 if dist > thresh {
-                    coord_sum += get_2d_idx(self.w, idx);
-                    count += 1;
+                    coords.push(get_2d_idx(self.w, idx));
                 }
             });
 
-        const ALLOWED_NOISE: u32 = 50;
-        if count > ALLOWED_NOISE {
-            Some(Coord::new(
-                coord_sum.x / count as usize,
-                ((coord_sum.y / count as usize) as f32 / y_divisor) as usize,
-            ))
+        const MIN_PIXELS: usize = 50;
+        if coords.len() > MIN_PIXELS {
+            Some(coords)
         } else {
             None
         }

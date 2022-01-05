@@ -1,18 +1,27 @@
 use crate::coord::Coord;
-use interception::*;
+use crate::logging::log;
+use interception::{is_mouse, Device, Filter, Interception, MouseFlags, MouseState, Stroke};
 use std::thread;
-use std::time;
-use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+use std::time::{Duration, Instant};
+use windows::Win32::{
+    Foundation::PWSTR,
+    UI::{
+        Input::KeyboardAndMouse::{
+            GetAsyncKeyState, GetKeyNameTextW, GetKeyboardState, MapVirtualKeyW,
+        },
+        WindowsAndMessaging::MAPVK_VK_TO_VSC_EX,
+    },
+};
 
+const INTERCEPTION_ERR: &str = "Error initializing interception - is the interception driver installed? (https://github.com/oblitum/Interception)";
 const CLICK_UP: MouseState = MouseState::MIDDLE_BUTTON_UP;
 const CLICK_DOWN: MouseState = MouseState::MIDDLE_BUTTON_DOWN;
 
 trait Empty {
-    fn empty() -> Self;
+    fn default() -> Self;
 }
-
 impl Empty for Stroke {
-    fn empty() -> Self {
+    fn default() -> Self {
         Stroke::Mouse {
             state: MouseState::empty(),
             flags: MouseFlags::empty(),
@@ -27,14 +36,13 @@ impl Empty for Stroke {
 trait CaptureMouse {
     fn capture_mouse(&mut self) -> i32;
 }
-
 impl CaptureMouse for Interception {
     fn capture_mouse(&mut self) -> i32 {
-        println!("Looking for mouse...");
-        self.set_filter(is_mouse, Filter::MouseFilter(MouseState::MOVE));
+        log!("Looking for mouse...");
+        self.set_filter(is_mouse, Filter::MouseFilter(MouseState::all()));
         let mouse_dev = self.wait();
         self.set_filter(is_mouse, Filter::MouseFilter(MouseState::empty()));
-        println!("Found mouse");
+        log!("Found mouse");
         mouse_dev
     }
 }
@@ -45,20 +53,13 @@ pub struct InterceptionState {
 }
 
 impl InterceptionState {
-    pub fn new(dev: Option<Device>) -> Self {
-        let mut interception = Interception::new().expect("Error initializing interception");
-        let mouse_dev = match dev {
-            Some(d) => d,
-            None => interception.capture_mouse(),
-        };
-        InterceptionState {
-            interception,
-            mouse_dev,
-        }
+    pub fn new(mouse_dev: Device) -> Result<Self, &'static str> {
+        let interception = Interception::new().ok_or(INTERCEPTION_ERR)?;
+        Ok(InterceptionState { interception, mouse_dev })
     }
 
     pub fn click_down(&self) {
-        let mut stroke = Stroke::empty();
+        let mut stroke = Stroke::default();
         if let Stroke::Mouse { ref mut state, .. } = stroke {
             *state = CLICK_DOWN;
         }
@@ -66,14 +67,14 @@ impl InterceptionState {
     }
 
     pub fn click_up(&self) {
-        let mut stroke = Stroke::empty();
+        let mut stroke = Stroke::default();
         if let Stroke::Mouse { ref mut state, .. } = stroke {
             *state = CLICK_UP;
         }
         self.interception.send(self.mouse_dev, &[stroke]);
     }
 
-    pub fn move_mouse_over_time(&self, dur: time::Duration, n_chunks: u32, pos: Coord<i32>) {
+    pub fn move_mouse_over_time(&self, dur: Duration, n_chunks: u32, pos: Coord<i32>) {
         let sleep_dur = dur / n_chunks;
         let chunked_x = pos.x / n_chunks as i32;
         let chunked_y = pos.y / n_chunks as i32;
@@ -101,15 +102,60 @@ pub fn key_pressed(key_code: i32) -> bool {
     unsafe { GetAsyncKeyState(key_code) < 0 }
 }
 
-pub fn wait_for_release(key_code: i32, timeout: time::Duration) {
-    let now = time::Instant::now();
-    while key_pressed(key_code) && now.elapsed() <= timeout {
-        thread::sleep(time::Duration::from_millis(1));
+pub fn wait_for_release(key_code: i32, timeout: Duration) {
+    let start = Instant::now();
+    while key_pressed(key_code) && start.elapsed() < timeout {
+        thread::sleep(Duration::from_millis(1));
     }
 }
 
-pub fn find_mouse_dev() -> i32 {
-    Interception::new()
-        .expect("Error initializing interception")
-        .capture_mouse()
+pub fn get_any_pressed_key() -> Result<Option<i32>, &'static str> {
+    let mut buf = [0u8; 256];
+    if !unsafe { GetKeyboardState(buf.as_mut_ptr()) }.as_bool() {
+        return Err("GetKeyboardState failed");
+    }
+    match buf
+        .iter()
+        .enumerate()
+        .find(|(_, &key_state)| (key_state >> 7) == 1)
+    {
+        Some((key_code, _)) => Ok(Some(key_code as i32)),
+        None => Ok(None),
+    }
+}
+
+pub fn keycode_to_string(key_code: i32) -> Result<String, &'static str> {
+    // MapVirtualKeyW doesn't recognize mouse keycodes
+    match key_code {
+        0x01 => return Ok("Mouse1".to_string()),
+        0x02 => return Ok("Mouse2".to_string()),
+        0x04 => return Ok("Mouse3".to_string()),
+        0x05 => return Ok("Mouse4".to_string()),
+        0x06 => return Ok("Mouse5".to_string()),
+        _ => (),
+    }
+
+    const BUF_SIZE: usize = 32;
+    let mut buf = [0u16; BUF_SIZE];
+    unsafe {
+        let scan_code = MapVirtualKeyW(key_code as u32, MAPVK_VK_TO_VSC_EX);
+        if scan_code != 0 {
+            let str_size = GetKeyNameTextW(
+                (scan_code as i32) << 16,
+                PWSTR(buf.as_mut_ptr()),
+                BUF_SIZE as i32,
+            );
+            if str_size > 0 {
+                Ok(String::from_utf16(&buf[..str_size as usize]).unwrap())
+            } else {
+                Err("GetKeyNameTextW failed")
+            }
+        } else {
+            Err("No translation from keycode to scancode")
+        }
+    }
+}
+
+pub fn find_mouse_dev() -> Result<i32, &'static str> {
+    Ok(Interception::new().ok_or(INTERCEPTION_ERR)?.capture_mouse())
 }

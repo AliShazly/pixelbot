@@ -1,4 +1,5 @@
 use num_derive::FromPrimitive;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Display;
@@ -6,18 +7,17 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::io::BufReader;
 use std::io::Write;
-use std::ops::Range;
-
-const CFG_FILE_PATH: &str = "./config.cfg";
+use std::ops::RangeInclusive;
+use std::path::Path;
 
 #[derive(Debug)]
-pub enum ReadError {
+pub enum ParseError {
     Parse(u32),
     InvalidKey(u32),
     OutOfBounds(u32),
 }
 
-impl fmt::Display for ReadError {
+impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Self::Parse(line_num) => write!(f, "Parse error on line {}", line_num),
@@ -27,7 +27,7 @@ impl fmt::Display for ReadError {
     }
 }
 
-impl std::error::Error for ReadError {}
+impl std::error::Error for ParseError {}
 
 #[derive(Debug, Hash, PartialEq, Eq, FromPrimitive, Clone, Copy)]
 pub enum CfgKey {
@@ -50,88 +50,86 @@ pub enum CfgKey {
 const N_CONFIG_ITEMS: usize = CfgKey::_Size as usize;
 
 impl CfgKey {
-    // Uses FromPrimitive to convert integer into variant of cfgkey struct
-    fn iter() -> impl Iterator<Item = Self> {
-        (0..N_CONFIG_ITEMS).map(|i| num::FromPrimitive::from_usize(i).unwrap())
-    }
-
-    fn default_val(&self) -> ValType {
+    pub fn default_val(&self) -> ValType {
         use CfgKey::*;
         use ValType::*;
 
         match *self {
-            CropW => Unsigned(CfgValue::new(1152, None)), // Bounds set at runtime for crop_w & crop_h
-            CropH => Unsigned(CfgValue::new(592, None)),
-            ColorThresh => Float(CfgValue::new(0.83, Some(0.0..1.0))),
-            AimDivisor => Float(CfgValue::new(3., Some(1.0..10.0))),
-            YDivisor => Float(CfgValue::new(1.3, Some(1.0..2.0))),
-            Fps => Unsigned(CfgValue::new(144, Some(1..240))),
-            MaxAutoclickSleepMs => Unsigned(CfgValue::new(90, Some(0..100))),
-            MinAutoclickSleepMs => Unsigned(CfgValue::new(50, Some(0..100))),
-            AimDurationMicros => Unsigned(CfgValue::new(50, Some(0..2000))),
-            AimSteps => Unsigned(CfgValue::new(2, Some(1..10))),
-            AimKeycode => Keycode(CfgValue::new(1, None)),
-            AutoclickKeycode => Keycode(CfgValue::new(1, None)),
-            ToggleAimKeycode => Keycode(CfgValue::new(190, None)),
-            ToggleAutoclickKeycode => Keycode(CfgValue::new(188, None)),
+            CropW => Unsigned(Bounded::new(1152, 0..=2560 - 1)), // Bounds set at runtime for crop_w & crop_h
+            CropH => Unsigned(Bounded::new(592, 0..=1440 - 1)),
+            ColorThresh => Float(Bounded::new(0.83, 0.001..=0.999)),
+            AimDivisor => Float(Bounded::new(3., 1.0..=10.0)),
+            YDivisor => Float(Bounded::new(1.3, 1.0..=2.0)),
+            Fps => Unsigned(Bounded::new(144, 1..=240)),
+            MaxAutoclickSleepMs => Unsigned(Bounded::new(90, 0..=100)),
+            MinAutoclickSleepMs => Unsigned(Bounded::new(50, 0..=100)),
+            AimDurationMicros => Unsigned(Bounded::new(50, 0..=2000)),
+            AimSteps => Unsigned(Bounded::new(2, 1..=10)),
+            AimKeycode => Keycode(1),
+            AutoclickKeycode => Keycode(1),
+            ToggleAimKeycode => Keycode(190),
+            ToggleAutoclickKeycode => Keycode(188),
             _ => panic!("Default values not exhaustive"),
         }
     }
 
+    // Uses FromPrimitive to convert integer into variant of cfgkey struct
+    pub fn iter() -> impl Iterator<Item = Self> {
+        (0..N_CONFIG_ITEMS).map(|i| num::FromPrimitive::from_usize(i).unwrap())
+    }
+
+    pub fn is_keycode(&self) -> bool {
+        matches!(self.default_val(), ValType::Keycode(_))
+    }
+
     pub fn as_string(&self) -> String {
-        camel_to_snake(format!("{:?}", self).as_str())
+        camel_to_snake(&format!("{:?}", self))
     }
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct CfgValue<T> {
+pub struct Bounded<T> {
     pub val: T,
-    pub bounds: Option<Range<T>>,
+    pub bounds: RangeInclusive<T>,
 }
 
-impl<T> CfgValue<T> {
-    pub fn new(val: T, bounds: Option<Range<T>>) -> Self {
+impl<T> Bounded<T> {
+    pub fn new(val: T, bounds: RangeInclusive<T>) -> Self {
         Self { val, bounds }
     }
-
-    // Allows casting between cfgvalues that would support it
-    fn from<U>(other: &CfgValue<U>) -> CfgValue<T>
-    where
-        U: num::NumCast + Copy,
-        T: num::NumCast + Copy,
-    {
-        CfgValue {
-            val: num::cast(other.val).unwrap(),
-            bounds: other
-                .bounds
-                .clone()
-                .map(|x| num::cast(x.start).unwrap()..num::cast(x.end).unwrap()),
-        }
-    }
-
-    fn val_in_bounds(&self, val: T) -> bool
-    where
-        T: std::cmp::PartialOrd + Copy,
-    {
-        if let Some(range) = &self.bounds {
-            range.contains(&val)
-        } else {
-            true // no bounds, allow all values
-        }
-    }
 }
 
-#[derive(Debug, PartialEq)]
-enum ValType {
-    Keycode(CfgValue<i32>),
-    Unsigned(CfgValue<u32>),
-    Float(CfgValue<f32>),
+macro_rules! enum_valtype {
+    ($(($name: ident, $val_typ: ty)),*) => {
+        #[derive(Debug, PartialEq, Clone)]
+        pub enum ValType {
+            $(
+                $name($val_typ),
+            )*
+        }
+
+        $(
+            impl From<ValType> for $val_typ {
+                fn from(v: ValType) -> $val_typ {
+                    match v {
+                        ValType::$name(v) => v,
+                        _ => panic!("ValType from/into wrong type, i tried so hard to make this a compile time error ;_;")
+                    }
+                }
+            }
+        )*
+    };
 }
+enum_valtype!(
+    (Keycode, i32),
+    (Unsigned, Bounded<u32>),
+    (Float, Bounded<f32>)
+);
 
 impl Display for ValType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Keycode(v) => write!(f, "{}", v.val),
+            Self::Keycode(v) => write!(f, "{}", v),
             Self::Unsigned(v) => write!(f, "{}", v.val),
             Self::Float(v) => write!(f, "{}", v.val),
         }
@@ -141,6 +139,7 @@ impl Display for ValType {
 #[derive(Debug)]
 pub struct Config {
     map: HashMap<CfgKey, ValType>,
+    pub is_dirty: bool,
 }
 
 impl Config {
@@ -148,75 +147,74 @@ impl Config {
         CfgKey::iter().for_each(|key| {
             map.entry(key).or_insert_with(|| key.default_val());
         });
-        Self { map }
+        Self { map, is_dirty: false }
     }
 
     pub fn default() -> Self {
         Self::new(CfgKey::iter().map(|key| (key, key.default_val())).collect())
     }
 
-    pub fn get<T>(&self, key: CfgKey) -> CfgValue<T>
-    where
-        T: num::NumCast + Copy,
-    {
-        match self.map.get(&key).unwrap() {
-            ValType::Keycode(x) => CfgValue::from(x),
-            ValType::Unsigned(x) => CfgValue::from(x),
-            ValType::Float(x) => CfgValue::from(x),
-        }
+    pub fn get(&self, key: CfgKey) -> ValType {
+        self.map.get(&key).unwrap().clone()
     }
 
-    pub fn set<T>(
-        &mut self,
-        key: CfgKey,
-        new_val: &CfgValue<T>,
-        update_bounds: bool,
-    ) -> Result<(), &'static str>
-    where
-        T: num::NumCast + Copy,
-    {
-        // Generates the match statement to assign to each of the numerical ValTypes,
-        // since each arm would do the exact same thing
-        macro_rules! match_assign {
-            ($obj:expr, $($matcher:path),*) => {
-                match $obj {
-                    $($matcher(ref mut val_ref) => {
-                        let new_val_cast = CfgValue::from(new_val);
-                        if update_bounds {
-                            if !new_val_cast.val_in_bounds(new_val_cast.val){
-                                return Err("New val out of provided bounds");
-                            }
-                            val_ref.bounds = new_val_cast.bounds;
-                        } else {
-                            if !val_ref.val_in_bounds(new_val_cast.val){
-                                return Err("New val out of stored bounds");
-                            }
-                        }
-                        val_ref.val = new_val_cast.val;
-                    }),*
+    pub fn set_val(&mut self, key: CfgKey, new_val: ValType) -> Result<(), &'static str> {
+        const ERR_MSG: &str = "Value not in bounds";
+        match self.map.get_mut(&key).unwrap() {
+            ValType::Unsigned(bv) => {
+                let new_val: Bounded<_> = new_val.into();
+                if bv.bounds.contains(&new_val.val) {
+                    bv.val = new_val.val;
+                } else {
+                    return Err(ERR_MSG);
                 }
             }
+            ValType::Float(bv) => {
+                let new_val: Bounded<_> = new_val.into();
+                if bv.bounds.contains(&new_val.val) {
+                    bv.val = new_val.val;
+                } else {
+                    return Err(ERR_MSG);
+                }
+            }
+            ValType::Keycode(kc) => *kc = new_val.into(),
         }
-
-        let val = self.map.get_mut(&key).unwrap();
-        match_assign!(val, ValType::Keycode, ValType::Unsigned, ValType::Float);
+        self.is_dirty = true;
         Ok(())
     }
 
-    pub fn write_to_file(&self) -> std::io::Result<()> {
+    pub fn set_bounds(&mut self, key: CfgKey, new_val: ValType) -> Result<(), &'static str> {
+        match self.map.get_mut(&key).unwrap() {
+            ValType::Unsigned(ref mut val_ref) => {
+                let new_val_cast: Bounded<_> = new_val.into();
+                val_ref.bounds = new_val_cast.bounds;
+                self.is_dirty = true;
+                Ok(())
+            }
+            ValType::Float(ref mut val_ref) => {
+                let new_val_cast: Bounded<_> = new_val.into();
+                val_ref.bounds = new_val_cast.bounds;
+                self.is_dirty = true;
+                Ok(())
+            }
+            _ => Err("No bounds to set"),
+        }
+    }
+
+    pub fn write_to_file(&self, path: &str) -> std::io::Result<()> {
         let content: String = CfgKey::iter()
             .map(|k| self.map.get_key_value(&k).unwrap())
             .map(|(k, v)| format!("{} = {}\n", k.as_string(), v))
             .collect();
-        let mut outfile = File::create(CFG_FILE_PATH)?;
+        let mut outfile = File::create(Path::new(path))?;
         outfile.write_all(content.as_bytes())
     }
 
-    pub fn from_file() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let key_lookup: HashMap<String, CfgKey> =
             HashMap::from_iter(CfgKey::iter().map(|k| k.as_string()).zip(CfgKey::iter()));
         let mut map: HashMap<CfgKey, ValType> = HashMap::new();
-        let infile = File::open(CFG_FILE_PATH)?;
+        let infile = File::open(Path::new(path))?;
         for (line_num, line) in BufReader::new(infile).lines().enumerate() {
             let line_num = (line_num as u32) + 1;
             let line_processed: String = line?
@@ -226,42 +224,41 @@ impl Config {
                 .collect();
             let line_split: Vec<&str> = line_processed.split('=').collect();
             if line_split.len() != 2 {
-                return Err(ReadError::Parse(line_num).into());
+                return Err(ParseError::Parse(line_num).into());
             }
 
             let key = key_lookup
                 .get(
                     &line_split[0]
                         .parse::<String>()
-                        .map_err(|_| ReadError::Parse(line_num))?,
+                        .map_err(|_| ParseError::Parse(line_num))?,
                 )
-                .ok_or(ReadError::InvalidKey(line_num))?;
+                .ok_or(ParseError::InvalidKey(line_num))?;
 
             // matching the default value for type info
             let value = match key.default_val() {
-                ValType::Keycode(_) => ValType::Keycode(CfgValue::new(
+                ValType::Keycode(_) => ValType::Keycode(
                     line_split[1]
                         .parse::<i32>()
-                        .map_err(|_| ReadError::Parse(line_num))?,
-                    None,
-                )),
+                        .map_err(|_| ParseError::Parse(line_num))?,
+                ),
                 ValType::Unsigned(v) => {
                     let val = line_split[1]
                         .parse::<u32>()
-                        .map_err(|_| ReadError::Parse(line_num))?;
-                    if !v.val_in_bounds(val) {
-                        return Err(Box::new(ReadError::OutOfBounds(line_num)));
+                        .map_err(|_| ParseError::Parse(line_num))?;
+                    if !v.bounds.contains(&val) {
+                        return Err(Box::new(ParseError::OutOfBounds(line_num)));
                     }
-                    ValType::Unsigned(CfgValue::new(val, v.bounds))
+                    ValType::Unsigned(Bounded::new(val, v.bounds))
                 }
                 ValType::Float(v) => {
                     let val = line_split[1]
                         .parse::<f32>()
-                        .map_err(|_| ReadError::Parse(line_num))?;
-                    if !v.val_in_bounds(val) {
-                        return Err(Box::new(ReadError::OutOfBounds(line_num)));
+                        .map_err(|_| ParseError::Parse(line_num))?;
+                    if !v.bounds.contains(&val) {
+                        return Err(Box::new(ParseError::OutOfBounds(line_num)));
                     }
-                    ValType::Float(CfgValue::new(val, v.bounds))
+                    ValType::Float(Bounded::new(val, v.bounds))
                 }
             };
             map.insert(*key, value);

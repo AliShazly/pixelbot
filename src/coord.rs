@@ -1,5 +1,7 @@
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 
+use num_traits::AsPrimitive;
+
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct Coord<T> {
     pub x: T,
@@ -60,5 +62,13 @@ where
             x: self.x - other.x,
             y: self.y - other.y,
         }
+    }
+}
+
+impl<T: AsPrimitive<i32>> Coord<T> {
+    pub fn square_dist(&self, other: Coord<T>) -> i32 {
+        let a = self.x.as_() - other.x.as_();
+        let b = self.y.as_() - other.y.as_();
+        (a * a) + (b * b)
     }
 }
