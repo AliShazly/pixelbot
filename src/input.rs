@@ -14,8 +14,6 @@ use windows::Win32::{
 };
 
 const INTERCEPTION_ERR: &str = "Error initializing interception - is the interception driver installed? (https://github.com/oblitum/Interception)";
-const CLICK_UP: MouseState = MouseState::MIDDLE_BUTTON_UP;
-const CLICK_DOWN: MouseState = MouseState::MIDDLE_BUTTON_DOWN;
 
 trait Empty {
     fn default() -> Self;
@@ -50,18 +48,26 @@ impl CaptureMouse for Interception {
 pub struct InterceptionState {
     interception: Interception,
     mouse_dev: Device,
+    click_down: MouseState,
+    click_up: MouseState,
 }
 
 impl InterceptionState {
     pub fn new(mouse_dev: Device) -> Result<Self, &'static str> {
         let interception = Interception::new().ok_or(INTERCEPTION_ERR)?;
-        Ok(InterceptionState { interception, mouse_dev })
+
+        Ok(InterceptionState {
+            interception,
+            mouse_dev,
+            click_down: MouseState::LEFT_BUTTON_DOWN,
+            click_up: MouseState::LEFT_BUTTON_UP,
+        })
     }
 
     pub fn click_down(&self) {
         let mut stroke = Stroke::default();
         if let Stroke::Mouse { ref mut state, .. } = stroke {
-            *state = CLICK_DOWN;
+            *state = self.click_down;
         }
         self.interception.send(self.mouse_dev, &[stroke]);
     }
@@ -69,9 +75,23 @@ impl InterceptionState {
     pub fn click_up(&self) {
         let mut stroke = Stroke::default();
         if let Stroke::Mouse { ref mut state, .. } = stroke {
-            *state = CLICK_UP;
+            *state = self.click_up;
         }
         self.interception.send(self.mouse_dev, &[stroke]);
+    }
+
+    pub fn set_click_keycode(&mut self, keycode: i32) -> Result<(), &'static str> {
+        let (click_down, click_up) = match keycode {
+            0x01 => (MouseState::LEFT_BUTTON_DOWN, MouseState::LEFT_BUTTON_UP),
+            0x02 => (MouseState::RIGHT_BUTTON_DOWN, MouseState::RIGHT_BUTTON_UP),
+            0x04 => (MouseState::MIDDLE_BUTTON_DOWN, MouseState::MIDDLE_BUTTON_UP),
+            0x05 => (MouseState::BUTTON_4_DOWN, MouseState::BUTTON_4_UP),
+            0x06 => (MouseState::BUTTON_5_DOWN, MouseState::BUTTON_5_UP),
+            _ => return Err("Invalid click keycode"),
+        };
+        self.click_down = click_down;
+        self.click_up = click_up;
+        Ok(())
     }
 
     pub fn move_mouse_over_time(&self, dur: Duration, n_chunks: u32, pos: Coord<i32>) {

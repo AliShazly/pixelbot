@@ -12,14 +12,6 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::time::Instant;
 
-const TARGET_COLOR: Color<u8> = Color {
-    //cerise
-    r: 196,
-    g: 58,
-    b: 172,
-    a: 255,
-};
-
 pub struct CapData {
     pub img: Image<Vec<u8>, Bgra8>,
     pub target_coords: Option<Vec<Coord<usize>>>,
@@ -153,6 +145,7 @@ impl PixelBot {
                     <ValType as Into<Bounded<_>>>::into(cfg.get(CfgKey::AimSteps)).val;
                 let aim_key = <ValType as Into<i32>>::into(cfg.get(CfgKey::AimKeycode));
                 let toggle_key = <ValType as Into<i32>>::into(cfg.get(CfgKey::ToggleAimKeycode));
+                let target_color = <ValType as Into<Color<u8>>>::into(cfg.get(CfgKey::TargetColor));
                 drop(cfg);
 
                 loop {
@@ -196,7 +189,7 @@ impl PixelBot {
                     let mut aim_coord: Option<Coord<usize>> = None; // Average of all the detected pixel coords
 
                     // Search through image and find avg position of the target color
-                    let mut relative_coord = match cropped.detect_color(TARGET_COLOR, color_thresh)
+                    let mut relative_coord = match cropped.detect_color(target_color, color_thresh)
                     {
                         Some(coords) => {
                             let count = coords.len();
@@ -257,7 +250,7 @@ impl PixelBot {
                 Redirected(bool), // mmb clicks mirror autoclick key clicks, stores whether pressed
             }
             let mut click_mode = ClickMode::Regular;
-            let interception = InterceptionState::new(mouse_dev).unwrap();
+            let mut interception = InterceptionState::new(mouse_dev).unwrap();
             let mut rng = rand::thread_rng();
             log!("Clickmode: {:?}\nStarting click thread", click_mode);
 
@@ -267,11 +260,20 @@ impl PixelBot {
                     <ValType as Into<i32>>::into(cfg.get(CfgKey::AutoclickKeycode));
                 let toggle_autoclick_key: i32 =
                     <ValType as Into<i32>>::into(cfg.get(CfgKey::ToggleAutoclickKeycode));
+                let fake_lmb_key: i32 =
+                    <ValType as Into<i32>>::into(cfg.get(CfgKey::FakeLmbKeycode));
                 let mut max_sleep: u32 =
                     <ValType as Into<Bounded<_>>>::into(cfg.get(CfgKey::MaxAutoclickSleepMs)).val;
                 let mut min_sleep: u32 =
                     <ValType as Into<Bounded<_>>>::into(cfg.get(CfgKey::MinAutoclickSleepMs)).val;
                 drop(cfg);
+
+                if interception.set_click_keycode(fake_lmb_key).is_err() {
+                    log_err!(
+                        "Invalid value for {}, using default",
+                        CfgKey::FakeLmbKeycode.as_string()
+                    );
+                }
 
                 if max_sleep < min_sleep {
                     log_err!(

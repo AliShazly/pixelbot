@@ -18,7 +18,7 @@ pub struct SubpxOrder {
 const RGBA_ORDER: SubpxOrder = SubpxOrder { r: 0, g: 1, b: 2, a: 3 };
 const BGRA_ORDER: SubpxOrder = SubpxOrder { r: 2, g: 1, b: 0, a: 3 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Color<T> {
     pub r: T,
     pub g: T,
@@ -28,6 +28,28 @@ pub struct Color<T> {
 impl<T: Copy> Color<T> {
     pub fn new(r: T, g: T, b: T, a: T) -> Self {
         Self { r, g, b, a }
+    }
+
+    fn lerp_(a: T, b: T, t: f32) -> T
+    where
+        T: AsPrimitive<f32>,
+        f32: AsPrimitive<T>,
+    {
+        (a.as_() + t * (b.as_() - a.as_())).as_()
+    }
+
+    #[must_use]
+    pub fn lerp(&self, other: Self, t: f32) -> Self
+    where
+        T: AsPrimitive<f32>,
+        f32: AsPrimitive<T>,
+    {
+        Color::new(
+            Self::lerp_(self.r, other.r, t),
+            Self::lerp_(self.g, other.g, t),
+            Self::lerp_(self.b, other.b, t),
+            Self::lerp_(self.a, other.a, t),
+        )
     }
 }
 

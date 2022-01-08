@@ -1,6 +1,6 @@
 use crate::config::{Bounded, CfgKey, Config, ValType};
 use crate::coord::Coord;
-use crate::image::{self, image_ops::BlendType, Bgra8, Rgba8, Subpixel};
+use crate::image::{self, image_ops::BlendType, Bgra8, Rgba8};
 use crate::input::{get_any_pressed_key, keycode_to_string, wait_for_release};
 use crate::logging::{self, drain_log, log, log_err};
 use crate::pixel_bot;
@@ -18,10 +18,12 @@ use fltk::{
     valuator::*,
     window::*,
 };
-use std::cell::RefCell;
+use fltk_theme::{SchemeType, WidgetScheme};
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -40,10 +42,10 @@ impl Bounds {
 
     pub fn gapify(self, gap: i32) -> Self {
         Self::new(
-            self.x + (gap / 2),
-            self.y + (gap / 2),
-            self.w - gap,
-            self.h - gap,
+            self.x + gap,
+            self.y + gap,
+            self.w - (gap * 2),
+            self.h - (gap * 2),
         )
     }
 }
@@ -56,6 +58,42 @@ impl NormalizedVal for HorFillSlider {
         self.value() / self.maximum()
     }
 }
+
+trait SetLabelWrap {
+    fn set_label_wrap(&mut self, label: String, max_w: i32);
+}
+impl<T> SetLabelWrap for T
+where
+    T: WidgetExt,
+{
+    fn set_label_wrap(&mut self, label: String, max_w: i32) {
+        const MARGIN: i32 = 0;
+
+        // getting px width of single character
+        self.set_label("_");
+        let line_w = ((max_w / self.measure_label().0) - MARGIN) as usize;
+
+        // wrapping label string
+        let mut label_bytes = label.into_bytes();
+        wrap_str_inplace(&mut label_bytes[..], line_w);
+        let label = String::from_utf8(label_bytes).unwrap();
+        self.set_label(&label);
+    }
+}
+
+trait SetColorInternal {
+    fn set_color_internal(&mut self, color: image::Color<u8>);
+}
+impl<T> SetColorInternal for T
+where
+    T: WidgetExt,
+{
+    fn set_color_internal(&mut self, color: image::Color<u8>) {
+        let c = Color::from_rgb(color.r, color.g, color.b);
+        self.set_color(c);
+    }
+}
+
 struct Graph {
     b: Bounds,
     data_range: Range<i32>,
@@ -70,21 +108,18 @@ struct Graph {
 impl Graph {
     pub fn new(b: Bounds, data_range: Range<i32>) -> Self {
         let label_h = (b.h as f32 * 0.05) as i32;
-        let frame = Frame::default()
-            .with_pos(b.x, b.y)
-            .with_size(b.w, b.h - label_h);
+        let (frame_w, frame_h) = (b.w, b.h - label_h);
+        let frame = Frame::new(b.x, b.y, frame_w, frame_h, "");
         let mut label_frame = Frame::new(frame.x(), frame.y() + frame.h(), b.w, label_h, "")
             .with_align(Align::Left | Align::Inside);
 
-        let buf = vec![0; b.w as usize * b.h as usize * Rgba8::N_SUBPX];
-        let graph_img: image::Image<_, Rgba8> =
-            image::Image::new(buf.clone(), b.w as usize, b.h as usize);
-        let mut bg_img: image::Image<_, Rgba8> = image::Image::new(buf, b.w as usize, b.h as usize);
+        let graph_img = image::Image::<Vec<_>, Rgba8>::zeroed(frame_w as usize, frame_h as usize);
+        let mut bg_img = image::Image::<Vec<_>, Rgba8>::zeroed(frame_w as usize, frame_h as usize);
         bg_img.fill_color(image::Color::new(93, 182, 33, 255));
         bg_img.draw_grid(30, image::Color::new(30, 29, 192, 255));
 
         label_frame.set_label_font(Font::Courier);
-        label_frame.set_label_size(label_h);
+        label_frame.set_label_size(label_h - 2 /*small margin*/);
         label_frame.set_frame(FrameType::FlatBox);
         label_frame.set_color(Color::Green);
 
@@ -111,12 +146,25 @@ impl Graph {
                 image::Color::new(255, 0, 0, 255),
             );
         });
+
         self.img.blend(BlendType::Over, &self.bg_img);
     }
 
     pub fn draw(&mut self) {
         if self.redraw {
             self.redraw = false;
+
+            let (frame_w, frame_h) = (self.frame.w() as usize, self.frame.h() as usize);
+            if let Some(scaled_img) = self.img.scale_nearest(frame_w, frame_h) {
+                self.points.clear();
+                self.img = scaled_img;
+                self.bg_img =
+                    image::Image::<Vec<_>, Rgba8>::zeroed(frame_w as usize, frame_h as usize);
+                self.bg_img.fill_color(image::Color::new(93, 182, 33, 255));
+                self.bg_img
+                    .draw_grid(30, image::Color::new(30, 29, 192, 255));
+            }
+
             self.draw_lines();
             draw::draw_rgba(&mut self.frame, self.img.as_slice()).unwrap();
             self.label_frame.redraw_label();
@@ -137,9 +185,9 @@ impl Graph {
 
         self.points
             .iter_mut()
-            .for_each(|c| (*c).x = clamp(c.x + INC, 0, self.b.w - 1));
+            .for_each(|c| (*c).x = clamp(c.x + INC, 0, self.frame.w() - 1));
         self.points.push_back(Coord::new(0, y_scaled as i32));
-        if self.points.len() > ((self.b.w - 1) / INC) as usize {
+        if self.points.len() > ((self.frame.w() - 1) / INC) as usize {
             self.points.pop_front();
         };
         self.label_frame.set_label(&format!("{:?}", time));
@@ -151,10 +199,6 @@ impl Graph {
 struct CropBox {
     bg_bx: Group,
     bx: Group,
-    x_offset: i32,
-    y_offset: i32,
-    max_w: i32,
-    max_h: i32,
 }
 
 impl CropBox {
@@ -169,37 +213,30 @@ impl CropBox {
         fg_box.set_color(Color::Green);
         fg_box.end();
 
-        CropBox {
-            bx: fg_box,
-            bg_bx: bg_box,
-            max_w: b.w,
-            max_h: b.h,
-            x_offset: b.x,
-            y_offset: b.y,
-        }
+        CropBox { bx: fg_box, bg_bx: bg_box }
     }
 
     pub fn change_bounds(&mut self, x_percent: f64, y_percent: f64) {
         if x_percent > 0. {
-            let x_pixels = (x_percent * self.max_w as f64).round() as i32;
+            let x_pixels = (x_percent * self.bg_bx.w() as f64).round() as i32;
             let box_y = self.bx.y();
             let box_h = self.bx.height();
             self.bx.resize(
-                (x_pixels / 2) + self.x_offset,
+                (x_pixels / 2) + self.bg_bx.x(),
                 box_y,
-                self.max_w - x_pixels,
+                self.bg_bx.w() - x_pixels,
                 box_h,
             );
         }
         if y_percent > 0. {
-            let y_pixels = (y_percent * self.max_h as f64).round() as i32;
+            let y_pixels = (y_percent * self.bg_bx.h() as f64).round() as i32;
             let box_x = self.bx.x();
             let box_w = self.bx.width();
             self.bx.resize(
                 box_x,
-                (y_pixels / 2) + self.y_offset,
+                (y_pixels / 2) + self.bg_bx.y(),
                 box_w,
-                self.max_h - y_pixels,
+                self.bg_bx.h() - y_pixels,
             );
         }
         self.bg_bx.redraw();
@@ -207,17 +244,127 @@ impl CropBox {
     }
 }
 
+struct ResponsiveButton {
+    b: Bounds,
+    button: Button,
+    push_event: i32,
+    release_event: i32,
+}
+
+impl ResponsiveButton {
+    fn new(bnds: Bounds, label: String, font: Font) -> Self {
+        let button_released = unique_event_id();
+        let button_pushed = unique_event_id();
+        let fade_out = unique_event_id();
+
+        // group handles color changes
+        let mut draw_frame = Frame::new(bnds.x, bnds.y, bnds.w, bnds.h, "");
+        let mut grp = Group::new(bnds.x, bnds.y, bnds.w, bnds.h, "");
+        grp.set_frame(FrameType::RFlatBox);
+        draw_frame.set_frame(FrameType::FlatBox);
+
+        let mut button = Button::new(bnds.x, bnds.y, bnds.w, bnds.h, "").with_align(Align::Wrap);
+        button.set_frame(FrameType::NoBox);
+        button.set_down_frame(FrameType::NoBox);
+        button.set_label_font(font);
+
+        grp.end();
+
+        let (r, g, b) = Color::Background.to_rgb();
+        let idle_color = image::Color::new(r, g, b, 255);
+
+        let (r, g, b) = Color::Background.darker().to_rgb();
+        let hover_color = image::Color::new(r, g, b, 255);
+
+        let (r, g, b) = Color::Background.darker().darker().to_rgb();
+        let push_color = image::Color::new(r, g, b, 255);
+
+        const LERP_INC: f32 = 1. / 10.;
+        const ITER_TIME: f64 = 1. / 144.;
+        let mut fade_color = idle_color;
+        let mut fade_lerp = 0.;
+        let mut continue_fading_out = false;
+        grp.handle(move |g, ev| match ev {
+            Event::Enter => {
+                draw::set_cursor(Cursor::Hand);
+                if continue_fading_out {
+                    continue_fading_out = false;
+                }
+                g.set_color_internal(hover_color);
+                draw_frame.redraw();
+                g.redraw();
+                true
+            }
+            Event::Leave => {
+                draw::set_cursor(Cursor::Default);
+                continue_fading_out = true;
+                fade_color = idle_color;
+                app::handle_main(fade_out).unwrap();
+                true
+            }
+            _ if ev.bits() == fade_out => {
+                if fade_lerp > (1. + f32::EPSILON) {
+                    continue_fading_out = false;
+                }
+                if !continue_fading_out {
+                    fade_lerp = 0.;
+                    return true;
+                }
+
+                let (cur_r, cur_g, cur_b) = g.color().to_rgb();
+                let current_color = image::Color::new(cur_r, cur_g, cur_b, 255);
+                let faded_color = current_color.lerp(fade_color, fade_lerp);
+                fade_lerp += LERP_INC;
+                g.set_color_internal(faded_color);
+                draw_frame.redraw();
+                g.redraw();
+                app::add_timeout3(ITER_TIME, move |_| {
+                    let _ = app::handle_main(fade_out);
+                });
+                true
+            }
+            _ if ev.bits() == button_pushed => {
+                g.set_color_internal(push_color);
+                draw_frame.redraw();
+                g.redraw();
+                true
+            }
+            _ if ev.bits() == button_released => {
+                g.set_color_internal(hover_color);
+                draw_frame.redraw();
+                g.redraw();
+                true
+            }
+            _ => false,
+        });
+
+        let mut ret = Self {
+            b: bnds,
+            button,
+            push_event: button_pushed,
+            release_event: button_released,
+        };
+        ret.button.set_label_wrap(label, ret.button.width());
+        ret
+    }
+}
+
 pub struct Gui {
     app: App,
     window: Window,
     config: Arc<RwLock<Config>>,
-    init_fns: Vec<Box<dyn FnOnce()>>,
+
+    // we don't want multiple keycode buttons searching for input concurrently
+    capture_input_lock: Rc<Cell<bool>>,
 }
 
 impl Gui {
     pub fn new(w: i32, h: i32, config: Arc<RwLock<Config>>) -> Self {
         let app = App::default();
+        let scheme = WidgetScheme::new(SchemeType::SvgBased);
+        scheme.apply();
         app::set_visible_focus(false);
+        app::set_frame_type(FrameType::RFlatBox);
 
         if let Ok(font) = Font::load_font("JetBrainsMono-Medium.ttf") {
             Font::set_font(Font::Courier, &font);
@@ -227,11 +374,13 @@ impl Gui {
         }
         let window = Window::new(w / 2, h / 2, w, h, "ayooo");
 
+        let capture_input_lock = Rc::new(Cell::new(false));
+
         Self {
             window,
             app,
             config,
-            init_fns: Vec::new(),
+            capture_input_lock,
         }
     }
 
@@ -242,15 +391,16 @@ impl Gui {
 
     pub fn init(
         &mut self,
-        screen_w: i32,
-        screen_h: i32,
+        screen_aspect_ratio: f32,
         receiver: channel::Receiver<pixel_bot::Message>,
         cfg_path: &'static str,
     ) {
         // app::background(0, 0, 0);
         // app::foreground(20, 20, 20);
+        self.window.make_resizable(true);
+        self.window.size_range(800, 700, 3480, 2160);
 
-        const GAP: i32 = 10;
+        const GAP: i32 = 5;
         const SLIDER_H: i32 = 50;
         const MIDDLE_OFFSET: i32 = 50;
 
@@ -258,62 +408,41 @@ impl Gui {
 
         // Sliders & crop widget (right side)
         let right_x = (win_w / 2) + MIDDLE_OFFSET;
-        let right_y = GAP / 2;
-        let right_w = ((win_w - GAP) / 2) - MIDDLE_OFFSET;
+        let right_y = GAP;
+        let right_w = ((win_w - (GAP * 2)) / 2) - MIDDLE_OFFSET;
 
         // crop widget
-        let crop_box_b =
-            self.create_crop_widget(right_x, right_y, screen_w, screen_h, SLIDER_H, right_w);
+        let crop_box_b = self.create_crop_widget(
+            right_x,
+            right_y,
+            screen_aspect_ratio,
+            SLIDER_H,
+            right_w,
+            GAP,
+        );
 
         // slider group
-        let mut cur_slider_b = Bounds::new(right_x, crop_box_b.y + crop_box_b.h, right_w, SLIDER_H);
+        let mut cur_slider_b = Bounds::new(
+            right_x,
+            crop_box_b.y + crop_box_b.h + GAP,
+            right_w,
+            SLIDER_H,
+        );
         let mut slider_grp_b = cur_slider_b;
         CfgKey::iter()
             .filter(|key| !matches!(key, CfgKey::CropW | CfgKey::CropH))
-            .filter(|key| !key.is_keycode())
+            .filter(|key| matches!(key.default_val(), ValType::Unsigned(_) | ValType::Float(_)))
             .for_each(|key| {
                 self.create_config_slider(cur_slider_b, key, key.as_string());
-                cur_slider_b.y += cur_slider_b.h;
+                cur_slider_b.y += cur_slider_b.h + GAP;
             });
         slider_grp_b.h = cur_slider_b.y - slider_grp_b.y;
 
         // keycode button group
-        let mut button_ev_id = 100;
-        let n_keycodes = CfgKey::iter().filter(|k| k.is_keycode()).count() as i32;
         let buttons_y = slider_grp_b.y + slider_grp_b.h;
-        let mut cur_but_b = Bounds::new(
-            right_x,
-            buttons_y + (GAP / 2),
-            right_w / n_keycodes,
-            ((win_w - buttons_y) / 2) - (GAP / 2),
-        );
-        let mut but_grp_b = cur_but_b;
-        CfgKey::iter()
-            .filter(|key| key.is_keycode())
-            .for_each(|key| {
-                self.create_keycode_but(
-                    cur_but_b,
-                    key,
-                    match key {
-                        CfgKey::AimKeycode => "Start Aim".to_string(),
-                        CfgKey::ToggleAimKeycode => "Toggle Aim".to_string(),
-                        CfgKey::AutoclickKeycode => "Autoclick".to_string(),
-                        CfgKey::ToggleAutoclickKeycode => "Cycle Autoclick Mode".to_string(),
-                        _ => panic!("Keycode match not exhaustive"),
-                    },
-                    button_ev_id,
-                );
-                button_ev_id += 1;
-                cur_but_b.x += cur_but_b.w;
-            });
-        but_grp_b.w = cur_but_b.x - but_grp_b.x;
-        self.create_save_config_but(
-            Bounds::new(
-                right_x,
-                (but_grp_b.y + but_grp_b.h) + (GAP / 2),
-                right_w,
-                but_grp_b.h - (GAP / 2),
-            ),
+        self.create_cfg_button_group(
+            Bounds::new(right_x, buttons_y, right_w, (win_w - buttons_y) - GAP),
+            3,
             cfg_path,
         );
 
@@ -321,7 +450,7 @@ impl Gui {
         let left_w = (win_w / 2) + MIDDLE_OFFSET;
         let left_h = win_h / 3;
 
-        let frm_b = Bounds::new(0, 0, left_w, left_h + GAP).gapify(GAP);
+        let frm_b = Bounds::new(0, 0, left_w, left_h + (GAP * 2)).gapify(GAP);
         let mut img_frame = Frame::new(frm_b.x, frm_b.y, frm_b.w, frm_b.h, "");
         let mut img_frame_img =
             image::Image::<Vec<_>, Rgba8>::zeroed(frm_b.w as usize, frm_b.h as usize);
@@ -348,7 +477,7 @@ impl Gui {
         ];
 
         let mut now = Instant::now();
-        app::add_idle(move || {
+        app::add_idle3(move |_| {
             // blinking terminal cursor
             if now.elapsed() > Duration::from_secs_f32(0.5) {
                 if term.cursor_color() == Color::Black {
@@ -393,20 +522,47 @@ impl Gui {
             graph.draw();
 
             // only getting the latest capturedata message
-            if let Some(pixel_bot::Message::CaptureData(mut data)) = msgs
+            if let Some(pixel_bot::Message::CaptureData(data)) = msgs
                 .into_iter()
                 .rev()
                 .find(|msg| matches!(msg, pixel_bot::Message::CaptureData(_)))
             {
-                if let (Some(aim_coord), Some(target_coords)) = (data.aim_coord, data.target_coords)
+                let (frame_w, frame_h) = (img_frame.w() as usize, img_frame.h() as usize);
+                let (old_w, old_h) = (data.img.w, data.img.h);
+                let mut resized_data_img = match data.img.scale_keep_aspect(frame_w, frame_h) {
+                    Some(resized) => resized,
+                    None => data.img,
+                };
+
+                if let (Some(mut aim_coord), Some(mut target_coords)) =
+                    (data.aim_coord, data.target_coords)
                 {
-                    draw_image_overlay(&mut data.img, aim_coord, target_coords);
+                    // scaling coords by resize ratio
+                    let ratio = Coord::new(
+                        resized_data_img.w as f32 / old_w as f32,
+                        resized_data_img.h as f32 / old_h as f32,
+                    );
+
+                    aim_coord = Coord::new(
+                        (aim_coord.x as f32 * ratio.x) as usize,
+                        (aim_coord.y as f32 * ratio.y) as usize,
+                    );
+
+                    target_coords.iter_mut().for_each(|coord| {
+                        coord.x = (coord.x as f32 * ratio.x) as usize;
+                        coord.y = (coord.y as f32 * ratio.y) as usize;
+                    });
+
+                    draw_image_overlay(&mut resized_data_img, aim_coord, target_coords);
                 }
-                let resized = data
-                    .img
-                    .scale_keep_aspect(img_frame.w() as usize, img_frame.h() as usize);
+
+                if let Some(resized_bg) = img_frame_img.scale_nearest(frame_w, frame_h) {
+                    img_frame_img = resized_bg;
+                }
+
                 img_frame_img.fill_color(image::Color::new(0, 0, 0, 255));
-                img_frame_img.layer_image_over(&resized);
+                img_frame_img.layer_image_over(&resized_data_img);
+
                 draw::draw_rgba(&mut img_frame, img_frame_img.as_slice()).unwrap();
                 img_frame.redraw();
             }
@@ -414,11 +570,6 @@ impl Gui {
 
         self.window.end();
         self.window.show();
-
-        let init_fns = std::mem::take(&mut self.init_fns);
-        for init_fn in init_fns {
-            init_fn();
-        }
     }
 
     fn create_term(b: Bounds) -> SimpleTerminal {
@@ -428,24 +579,50 @@ impl Gui {
         term.set_cursor_style(fltk::text::Cursor::Simple);
         term.set_scrollbar_size(-1); // no scrollbar
         term.set_ansi(true);
+        term.set_frame(app::frame_type());
         term
+    }
+
+    fn create_cfg_button_group(&self, b: Bounds, row_len: i32, cfg_save_path: &'static str) {
+        let pretty_name = |key: CfgKey| match key {
+            CfgKey::AimKeycode => "Start Aim".to_string(),
+            CfgKey::ToggleAimKeycode => "Toggle Aim".to_string(),
+            CfgKey::AutoclickKeycode => "Autoclick".to_string(),
+            CfgKey::ToggleAutoclickKeycode => "Cycle Autoclick Mode".to_string(),
+            CfgKey::FakeLmbKeycode => "Fake Lmb".to_string(),
+            _ => panic!("Keycode match not exhaustive"),
+        };
+        let n_buttons = CfgKey::iter().filter(|k| k.is_keycode()).count() as i32;
+
+        let button_w = b.w / row_len;
+        let button_h = b.h / ((button_w * n_buttons) as f32 / b.w as f32).ceil() as i32;
+
+        let mut current_bounds = Bounds::new(b.x, b.y, button_w, button_h);
+        for key in CfgKey::iter().filter(|k| k.is_keycode()) {
+            self.create_keycode_but(current_bounds, key, pretty_name(key));
+            current_bounds.x += button_w;
+            if current_bounds.x + button_w > b.x + b.w {
+                current_bounds.x = b.x;
+                current_bounds.y += button_h;
+            }
+        }
+        self.create_save_config_but(current_bounds, cfg_save_path);
     }
 
     fn create_crop_widget(
         &mut self,
         x: i32,
         y: i32,
-        screen_w: i32,
-        screen_h: i32,
+        aspect_ratio: f32,
         slider_h: i32,
         box_w: i32,
+        slider_gap: i32,
     ) -> Bounds {
-        let ratio: f32 = screen_h as f32 / screen_w as f32;
-        let box_h = (box_w as f32 * ratio) as i32;
+        let box_h = (box_w as f32 * aspect_ratio) as i32;
         let crop_box = Rc::new(RefCell::new(CropBox::new(Bounds::new(x, y, box_w, box_h))));
 
-        let slider1_ypos = y + box_h;
-        let slider2_ypos = slider1_ypos + slider_h;
+        let slider1_ypos = y + box_h + slider_gap;
+        let slider2_ypos = slider1_ypos + slider_h + slider_gap;
         let mut slider1 = self.create_config_slider(
             Bounds::new(x, slider1_ypos, box_w, slider_h),
             CfgKey::CropW,
@@ -472,28 +649,29 @@ impl Gui {
         });
 
         let (init_x_percent, init_y_percent) = (slider1.norm_val(), slider2.norm_val());
-        self.init_fns.push(Box::new(move || {
-            crop_box
-                .borrow_mut()
-                .change_bounds(init_x_percent, init_y_percent);
-        }));
+        crop_box
+            .borrow_mut()
+            .change_bounds(init_x_percent, init_y_percent);
 
-        Bounds::new(x, y, box_w, box_h + (slider_h * 2)) // bounds of crop widget
+        Bounds::new(x, y, box_w, box_h + (slider_h * 2) + (slider_gap * 2))
     }
 
     fn create_save_config_but(&self, b: Bounds, cfg_path: &'static str) {
-        let mut button = Button::new(b.x, b.y, b.w, b.h, "_").with_align(Align::Wrap);
-        button.set_label_font(Font::CourierBold);
-
-        let mut label = *b"Save config to file";
-        let line_w = (b.w / button.measure_label().0) as usize;
-        wrap_str(&mut label, line_w);
-        button.set_label(&String::from_utf8_lossy(&label));
-        button.set_label_size(b.h / 5);
+        let ResponsiveButton {
+            b: _,
+            mut button,
+            push_event: button_pushed,
+            release_event: button_released,
+        } = ResponsiveButton::new(b, "Save config to file".to_string(), Font::CourierBold);
 
         let config = self.config.clone();
         button.handle(move |_, ev| match ev {
+            Event::Push => {
+                app::handle_main(button_pushed).unwrap();
+                true
+            }
             Event::Released => {
+                app::handle_main(button_released).unwrap();
                 config.write().unwrap().write_to_file(cfg_path).unwrap();
                 log!(
                     "Saved config to {}",
@@ -508,30 +686,14 @@ impl Gui {
         });
     }
 
-    fn create_keycode_but(
-        &self,
-        b: Bounds,
-        cfg_key: CfgKey,
-        mut label: String,
-        ev_id: i32,
-    ) -> Button {
+    fn create_keycode_but(&self, b: Bounds, cfg_key: CfgKey, label: String) -> Button {
         assert!(cfg_key.is_keycode());
 
-        const PUSH: i32 = Event::Push.bits();
-        const RELEASE: i32 = Event::Released.bits();
-        const TIMEOUT: Duration = Duration::from_secs(5);
+        let capture_input = unique_event_id();
 
-        let mut button = Button::new(b.x, b.y, b.w, b.h, "_");
-        button.set_label_font(Font::Courier);
-
-        let label_bytes = unsafe { label.as_bytes_mut() };
-        let line_w = (b.w / button.measure_label().0) as usize;
-        wrap_str(label_bytes, line_w - 3);
-        button.set_label(&label);
-
-        let init_val: i32 = self.config.read().unwrap().get(cfg_key).into();
-        let full_label = match keycode_to_string(init_val) {
-            Ok(string) => format!("{}:\n{}", label, string),
+        let init_keycode: i32 = self.config.read().unwrap().get(cfg_key).into();
+        let init_string = match keycode_to_string(init_keycode) {
+            Ok(string) => string,
             Err(_) => {
                 log_err!(
                     "Config entry `{}` is invalid, using default value",
@@ -540,53 +702,94 @@ impl Gui {
                 keycode_to_string(cfg_key.default_val().into()).unwrap()
             }
         };
-        button.set_label(&full_label);
-        button.set_label_font(Font::Courier);
 
-        let mut locked = false;
+        let ResponsiveButton {
+            b: _,
+            mut button,
+            push_event: button_pushed,
+            release_event: button_released,
+        } = ResponsiveButton::new(b, "".to_string(), Font::Courier);
+
+        // Label frames
+        let labels_gap = (b.h as f32 * 0.35) as i32;
+        let (center_x, center_y) = (b.x + (b.w / 2), b.y + (b.h / 2));
+        let mut name_label =
+            Frame::new(center_x, center_y - (labels_gap / 2), 0, 0, "").with_align(Align::Center);
+        let val_label = Rc::new(RefCell::new(
+            Frame::new(center_x, center_y + (labels_gap / 2), 0, 0, "").with_align(Align::Center),
+        ));
+
+        name_label.set_label_font(Font::Courier);
+        name_label.set_label_wrap(format!("{}:", label), button.width());
+        val_label.borrow_mut().set_label_font(Font::CourierBold);
+        val_label
+            .borrow_mut()
+            .set_label(&format!("'{}'", init_string));
+
+        let val_label_clone = val_label.clone();
+        button.draw(move |_| {
+            val_label_clone.borrow_mut().redraw_label();
+            name_label.redraw_label();
+        });
+
+        const TIMEOUT: Duration = Duration::from_secs(5);
         let mut start_on_release = false;
         let mut last_released = Instant::now();
+        let mut last_label = String::new();
         let config = self.config.clone();
-        button.handle(move |b, ev| match ev.bits() {
-            PUSH => {
-                if !locked {
-                    locked = true;
+        let locked = self.capture_input_lock.clone();
+        button.handle(move |but, ev| match ev {
+            Event::Push => {
+                if !locked.get() {
+                    locked.set(true);
+                    app::handle_main(button_pushed).unwrap();
 
                     // need to start capturing keys on release since lmb would get insta detected
                     start_on_release = true;
                 }
                 true
             }
-            RELEASE => {
+            Event::Released => {
+                app::handle_main(button_released).unwrap();
                 if start_on_release {
                     start_on_release = false;
+                    last_label = val_label.borrow().label();
+                    val_label
+                        .borrow_mut()
+                        .set_label_wrap("Press any key...".to_string(), but.width());
+                    but.redraw();
                     last_released = Instant::now();
-                    app::handle_main(ev_id).unwrap();
+                    app::handle_main(capture_input).unwrap();
                 }
                 true
             }
-            bits if bits == ev_id => {
+            _ if ev.bits() == capture_input => {
                 if let Ok(Some(keycode)) = get_any_pressed_key() {
                     match keycode_to_string(keycode) {
-                        Ok(name) => {
+                        Ok(keycode_string) => {
                             wait_for_release(keycode, Duration::from_millis(500));
                             config
                                 .write()
                                 .unwrap()
                                 .set_val(cfg_key, ValType::Keycode(keycode))
                                 .unwrap();
-                            b.set_label(&format!("{}:\n{}", label, name));
+                            val_label
+                                .borrow_mut()
+                                .set_label(&format!("'{}'", keycode_string));
+                            but.redraw();
                         }
                         Err(_) => log_err!("Invalid keycode received: {}", keycode),
                     }
-                    locked = false;
+                    locked.set(false);
                 } else if last_released.elapsed() >= TIMEOUT {
                     log!("Key change timeout reached");
-                    locked = false;
+                    val_label.borrow_mut().set_label(&last_label);
+                    but.redraw();
+                    locked.set(false);
                 } else {
-                    app::add_timeout(0.01, move || {
+                    app::add_timeout3(0.01, move |_| {
                         // handle_main will fail if called after window is closed
-                        let _ = app::handle_main(ev_id);
+                        let _ = app::handle_main(capture_input);
                     });
                 }
                 true
@@ -597,9 +800,12 @@ impl Gui {
     }
 
     fn create_config_slider(&self, b: Bounds, cfg_key: CfgKey, label: String) -> HorFillSlider {
+        let mut draw_frame = Frame::new(b.x, b.y, b.w, b.h, "");
         let mut slider = HorFillSlider::new(b.x, b.y, b.w, b.h, "");
+        draw_frame.set_frame(FrameType::FlatBox);
         slider.set_color(Color::Dark2);
-        slider.set_slider_frame(FrameType::EmbossedBox);
+        slider.set_selection_color(Color::Green);
+        slider.set_frame(app::frame_type());
 
         let val_type = self.config.read().unwrap().get(cfg_key);
         let (cfg_val, bounds_start, bounds_end, precision) = match val_type {
@@ -611,8 +817,8 @@ impl Gui {
             ),
             ValType::Float(ref v) => (
                 (v.val as f64 * 100.).trunc() / 100.,
-                *v.bounds.start() as f64,
-                *v.bounds.end() as f64,
+                (*v.bounds.start() as f64 * 100.).ceil() / 100.,
+                (*v.bounds.end() as f64 * 100.).floor() / 100.,
                 2,
             ),
             _ => panic!("Creating config slider from unbounded value"),
@@ -630,12 +836,13 @@ impl Gui {
         slider.draw(move |slider| {
             label_frame.redraw_label();
             label_frame.set_label(format!("{}: {}", label, slider.value()).as_str());
+            draw_frame.redraw();
         });
 
         let config = self.config.clone();
         slider.handle(move |slider, ev| match ev {
             Event::Released => {
-                let val = match &val_type {
+                let val = match val_type {
                     ValType::Unsigned(_) => {
                         ValType::Unsigned(Bounded::new(slider.value() as u32, 0..=0))
                     }
@@ -691,14 +898,14 @@ where
     }
 }
 
-fn wrap_str(wrap: &mut [u8], line_w: usize) {
+fn wrap_str_inplace(wrap: &mut [u8], line_w: usize) {
     wrap.split_mut(|c| *c == b'\n').for_each(|substr| {
         let mut last_space_idx = None;
         for (idx, c) in substr.iter().enumerate() {
             if idx > line_w {
                 if let Some(space_idx) = last_space_idx {
                     substr[space_idx] = b'\n';
-                    wrap_str(substr, line_w);
+                    wrap_str_inplace(substr, line_w);
                 }
                 break;
             }
@@ -707,4 +914,9 @@ fn wrap_str(wrap: &mut [u8], line_w: usize) {
             }
         }
     })
+}
+
+fn unique_event_id() -> i32 {
+    static EVENT_ID: AtomicI32 = AtomicI32::new(100);
+    EVENT_ID.fetch_add(1, Ordering::Relaxed)
 }

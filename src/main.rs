@@ -17,7 +17,7 @@ use pixel_bot::PixelBot;
 use std::io::{self, ErrorKind};
 use std::panic;
 use std::sync::{Arc, RwLock};
-use windows::Win32::UI::HiDpi::{SetProcessDpiAwareness, PROCESS_PER_MONITOR_DPI_AWARE};
+use windows::Win32::UI::HiDpi::{SetProcessDpiAwareness, PROCESS_SYSTEM_DPI_AWARE};
 
 const CFG_PATH: &str = "config.cfg";
 
@@ -32,31 +32,43 @@ fn set_panic_hook() {
 
 fn main() {
     set_panic_hook();
+
+    // windows scaling messes with fltk's svgbased frames
     unsafe {
-        let _ = SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
+        let _ = SetProcessDpiAwareness(PROCESS_SYSTEM_DPI_AWARE);
     }
 
     let config = Arc::new(RwLock::new(match Config::from_file(CFG_PATH) {
         Ok(cfg) => cfg,
         Err(err) => {
-            let cfg = Config::default();
+            let default_cfg = Config::default();
             log_err!("Error reading config file:");
             if err.is::<ParseError>() {
                 log_err!("\t{}", err);
-            } else if err.downcast::<io::Error>().unwrap().kind() == ErrorKind::NotFound {
-                log_err!("\tConfig file not found, saving default to {}", CFG_PATH);
-                cfg.write_to_file(CFG_PATH).unwrap();
+                match *err.downcast::<ParseError>().unwrap() {
+                    ParseError::NotExhaustive(ne_cfg, _) => ne_cfg,
+                    _ => {
+                        log_err!("Falling back to default config");
+                        default_cfg
+                    }
+                }
+            } else if err.is::<io::Error>() {
+                if err.downcast::<io::Error>().unwrap().kind() == ErrorKind::NotFound {
+                    log_err!("\tConfig file not found, saving default to {}", CFG_PATH);
+                    default_cfg.write_to_file(CFG_PATH).unwrap();
+                }
+                default_cfg
+            } else {
+                default_cfg
             }
-            log_err!("Falling back to default config");
-            cfg
         }
     }));
 
     // Setting crop_w and crop_h bounds relative to screen size
     let display = scrap::Display::primary().unwrap();
-    let (screen_w, scren_h) = (display.width() as u32, display.height() as u32);
+    let (screen_w, screen_h) = (display.width() as u32, display.height() as u32);
     let crop_w = ValType::Unsigned(Bounded::new(0, 0..=(screen_w / 2) - 1));
-    let crop_h = ValType::Unsigned(Bounded::new(0, 0..=(scren_h / 2) - 1));
+    let crop_h = ValType::Unsigned(Bounded::new(0, 0..=(screen_h / 2) - 1));
     let mut cfg = config.write().unwrap();
     cfg.set_bounds(CfgKey::CropW, crop_w).unwrap();
     cfg.set_bounds(CfgKey::CropH, crop_h).unwrap();
@@ -75,7 +87,7 @@ fn main() {
         });
 
         let mut gui = Gui::new(1000, 1000, config.clone());
-        gui.init(screen_w as i32, scren_h as i32, gui_receiver, CFG_PATH);
+        gui.init(screen_h as f32 / screen_w as f32, gui_receiver, CFG_PATH);
         while gui.wait(0.01) {
             if config.read().unwrap().is_dirty {
                 pixel_bot.lock().unwrap().reload().unwrap();

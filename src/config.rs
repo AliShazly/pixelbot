@@ -10,19 +10,34 @@ use std::io::Write;
 use std::ops::RangeInclusive;
 use std::path::Path;
 
+use crate::image::Color;
+
 #[derive(Debug)]
 pub enum ParseError {
-    Parse(u32),
+    Parse(u32, String),
     InvalidKey(u32),
     OutOfBounds(u32),
+    NotExhaustive(Config, Vec<CfgKey>),
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            Self::Parse(line_num) => write!(f, "Parse error on line {}", line_num),
+            Self::Parse(line_num, ref err_string) => {
+                write!(f, "Parse error on line {} => {}", line_num, err_string)
+            }
             Self::InvalidKey(line_num) => write!(f, "Invalid key on line {}", line_num),
             Self::OutOfBounds(line_num) => write!(f, "Out of bounds value on line {}", line_num),
+            Self::NotExhaustive(_, ref missing_keys) => {
+                write!(f, "Using defaults for missng values:\n|")?;
+                for res in missing_keys
+                    .iter()
+                    .map(|key| write!(f, " {} |", key.as_string()))
+                {
+                    res?
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -45,9 +60,11 @@ pub enum CfgKey {
     AutoclickKeycode,
     ToggleAimKeycode,
     ToggleAutoclickKeycode,
+    FakeLmbKeycode,
+    TargetColor,
     _Size, // Last item get assigned the size of the enum
 }
-const N_CONFIG_ITEMS: usize = CfgKey::_Size as usize;
+const N_CFG_KEYS: usize = CfgKey::_Size as usize;
 
 impl CfgKey {
     pub fn default_val(&self) -> ValType {
@@ -69,13 +86,15 @@ impl CfgKey {
             AutoclickKeycode => Keycode(1),
             ToggleAimKeycode => Keycode(190),
             ToggleAutoclickKeycode => Keycode(188),
+            FakeLmbKeycode => Keycode(4),
+            TargetColor => ColorRgb8(Color::<u8>::new(196, 58, 172, 255)),
             _ => panic!("Default values not exhaustive"),
         }
     }
 
     // Uses FromPrimitive to convert integer into variant of cfgkey struct
     pub fn iter() -> impl Iterator<Item = Self> {
-        (0..N_CONFIG_ITEMS).map(|i| num::FromPrimitive::from_usize(i).unwrap())
+        (0..N_CFG_KEYS).map(|i| num::FromPrimitive::from_usize(i).unwrap())
     }
 
     pub fn is_keycode(&self) -> bool {
@@ -123,7 +142,8 @@ macro_rules! enum_valtype {
 enum_valtype!(
     (Keycode, i32),
     (Unsigned, Bounded<u32>),
-    (Float, Bounded<f32>)
+    (Float, Bounded<f32>),
+    (ColorRgb8, Color<u8>)
 );
 
 impl Display for ValType {
@@ -132,6 +152,7 @@ impl Display for ValType {
             Self::Keycode(v) => write!(f, "{}", v),
             Self::Unsigned(v) => write!(f, "{}", v.val),
             Self::Float(v) => write!(f, "{}", v.val),
+            Self::ColorRgb8(c) => write!(f, "{}, {}, {}", c.r, c.g, c.b),
         }
     }
 }
@@ -178,6 +199,7 @@ impl Config {
                 }
             }
             ValType::Keycode(kc) => *kc = new_val.into(),
+            ValType::ColorRgb8(c) => *c = new_val.into(),
         }
         self.is_dirty = true;
         Ok(())
@@ -222,16 +244,21 @@ impl Config {
                 .filter(|x| *x != ' ') // removing whitespace
                 .take_while(|x| *x != '#') // ending line at first comment
                 .collect();
+            if line_processed.is_empty() {
+                continue;
+            }
             let line_split: Vec<&str> = line_processed.split('=').collect();
             if line_split.len() != 2 {
-                return Err(ParseError::Parse(line_num).into());
+                return Err(
+                    ParseError::Parse(line_num, "Multiple delimiters found".to_string()).into(),
+                );
             }
 
             let key = key_lookup
                 .get(
                     &line_split[0]
                         .parse::<String>()
-                        .map_err(|_| ParseError::Parse(line_num))?,
+                        .map_err(|e| ParseError::Parse(line_num, format!("{}", e)))?,
                 )
                 .ok_or(ParseError::InvalidKey(line_num))?;
 
@@ -240,12 +267,12 @@ impl Config {
                 ValType::Keycode(_) => ValType::Keycode(
                     line_split[1]
                         .parse::<i32>()
-                        .map_err(|_| ParseError::Parse(line_num))?,
+                        .map_err(|e| ParseError::Parse(line_num, format!("{}", e)))?,
                 ),
                 ValType::Unsigned(v) => {
                     let val = line_split[1]
                         .parse::<u32>()
-                        .map_err(|_| ParseError::Parse(line_num))?;
+                        .map_err(|e| ParseError::Parse(line_num, format!("{}", e)))?;
                     if !v.bounds.contains(&val) {
                         return Err(Box::new(ParseError::OutOfBounds(line_num)));
                     }
@@ -254,16 +281,39 @@ impl Config {
                 ValType::Float(v) => {
                     let val = line_split[1]
                         .parse::<f32>()
-                        .map_err(|_| ParseError::Parse(line_num))?;
+                        .map_err(|e| ParseError::Parse(line_num, format!("{}", e)))?;
                     if !v.bounds.contains(&val) {
                         return Err(Box::new(ParseError::OutOfBounds(line_num)));
                     }
                     ValType::Float(Bounded::new(val, v.bounds))
                 }
+                ValType::ColorRgb8(_) => {
+                    let mut rgb = Vec::with_capacity(3);
+                    for res in line_split[1].split(',').map(|num| num.parse::<u8>()) {
+                        rgb.push(res.map_err(|e| ParseError::Parse(line_num, format!("{}", e)))?)
+                    }
+                    if rgb.len() != 3 {
+                        return Err(Box::new(ParseError::Parse(
+                            line_num,
+                            "Color tuple doesn't have 3 elements".to_string(),
+                        )));
+                    }
+                    ValType::ColorRgb8(Color::new(rgb[0], rgb[1], rgb[2], 255))
+                }
             };
             map.insert(*key, value);
         }
-        Ok(Config::new(map))
+
+        let unused_keys: Vec<CfgKey> = CfgKey::iter().filter(|k| !map.contains_key(k)).collect();
+        if unused_keys.is_empty() {
+            Ok(Config::new(map))
+        } else {
+            // Config::new() auto fills in unused keys with defaults
+            Err(Box::new(ParseError::NotExhaustive(
+                Config::new(map),
+                unused_keys,
+            )))
+        }
     }
 }
 

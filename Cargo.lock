@@ -168,6 +168,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cocoa-colors"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7fc3439406f349e0bc20d7de87314803378a535190d12e62991f7c8474d5296"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "color-maps"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "120b737cc99b0d73bf0a9bfa6086e84c0bde3b955851f37f812865bc08b35feb"
+dependencies = [
+ "lazy_static",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -379,22 +397,35 @@ dependencies = [
 
 [[package]]
 name = "fltk"
-version = "1.2.19"
+version = "1.2.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1047ed32bcb49609956d1da35703267a733179e514ad606e030ca711da45574"
+checksum = "2894b854989432cd0b13b48eb77178eb897f70b2aa5ef064575df226139ff668"
 dependencies = [
  "bitflags",
+ "crossbeam-channel",
  "fltk-sys",
  "paste",
 ]
 
 [[package]]
 name = "fltk-sys"
-version = "1.2.19"
+version = "1.2.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76f644df7b9b362dad4361de2491e844281c98d95b56e0b07ff8e591311962b1"
+checksum = "4cd352c677ae3a1cd20235368825cc6887847e502a753d01799ff2878d0950c9"
 dependencies = [
  "cmake",
+]
+
+[[package]]
+name = "fltk-theme"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abee3d9b0ed8bd45d10e4cc279d757ce71c37224482e8377a99906f7be771266"
+dependencies = [
+ "cocoa-colors",
+ "color-maps",
+ "fltk",
+ "lazy_static",
 ]
 
 [[package]]
@@ -778,6 +809,7 @@ dependencies = [
  "criterion",
  "crossbeam",
  "fltk",
+ "fltk-theme",
  "interception",
  "line_drawing",
  "minifb",

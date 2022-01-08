@@ -39,8 +39,13 @@ where
         Image::new(out_buf, self.w - (2 * crop_w), self.h - (2 * crop_h))
     }
 
-    pub fn scale_nearest(&self, new_w: usize, new_h: usize) -> Image<Vec<S::Inner>, S> {
+    pub fn scale_nearest(&self, new_w: usize, new_h: usize) -> Option<Image<Vec<S::Inner>, S>> {
         assert!(new_w > 0 && new_h > 0);
+
+        // no resizing needed
+        if new_w == self.w && new_h == self.h {
+            return None;
+        }
 
         let mut out = Image::<Vec<_>, _>::zeroed(new_w, new_h);
         for x in 0..new_w {
@@ -56,10 +61,10 @@ where
                 );
             }
         }
-        out
+        Some(out)
     }
 
-    pub fn scale_keep_aspect(&self, new_w: usize, new_h: usize) -> Image<Vec<S::Inner>, S> {
+    pub fn scale_keep_aspect(&self, new_w: usize, new_h: usize) -> Option<Image<Vec<S::Inner>, S>> {
         let ratio = (new_w as f32 / self.w as f32).min(new_h as f32 / self.h as f32);
         self.scale_nearest(
             ((self.w as f32 * ratio) as usize).max(1),
@@ -146,7 +151,14 @@ where
         U: DerefMut<Target = [V::Inner]>,
         V: Subpixel<Inner = S::Inner>,
     {
-        assert!(other_img.w <= self.w && other_img.h <= self.h && V::N_SUBPX == S::N_SUBPX,);
+        assert!(
+            other_img.w <= self.w && other_img.h <= self.h && V::N_SUBPX == S::N_SUBPX,
+            "{}x{} <= {}x{}",
+            other_img.h,
+            other_img.w,
+            self.h,
+            self.w
+        );
 
         let col_skip = (self.w - other_img.w) / 2;
         let y_center_start = (self.h - other_img.h) / 2;
@@ -184,7 +196,10 @@ where
             };
 
             const STEP: usize = 32; // 32 subpixels (8 RGBA pixels) at a time; 8 * S::N_SUBPX
-            for idx in (0..self.w * self.h * S::N_SUBPX).step_by(STEP) {
+
+            // FIXME: blend_fn accesses out of bounds without subtracting 32 from the range
+            //      you need to do one final pass of blending for the last chunk of pixels which may not have a length of 32
+            for idx in (0..(self.w * self.h * S::N_SUBPX) - STEP).step_by(STEP) {
                 unsafe {
                     blend_fn(
                         self.buf[idx..].as_ptr(),
