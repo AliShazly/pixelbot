@@ -7,16 +7,16 @@ use crate::pixel_bot;
 
 use crossbeam::channel;
 use fltk::{
-    app::{self, *},
-    button::*,
+    app::{self, App},
+    button::Button,
     draw,
-    enums::*,
-    frame::*,
-    group::*,
+    enums::{Align, Color, Cursor, Event, Font, FrameType, Key},
+    frame::Frame,
+    group::Group,
     prelude::*,
     text::{SimpleTerminal, StyleTableEntry, TextBuffer},
-    valuator::*,
-    window::*,
+    valuator::HorFillSlider,
+    window::Window,
 };
 use rand::seq::IteratorRandom;
 use std::cell::{Cell, RefCell};
@@ -84,7 +84,7 @@ trait NormalizedVal {
 }
 impl NormalizedVal for HorFillSlider {
     fn norm_val(&self) -> f64 {
-        self.value() / self.maximum()
+        (self.value() - self.minimum()) / (self.maximum() - self.minimum())
     }
 }
 
@@ -105,7 +105,7 @@ where
         // wrapping label string
         let mut label_bytes = label.into_bytes();
         wrap_str_inplace(&mut label_bytes[..], line_w);
-        let label = String::from_utf8(label_bytes).unwrap();
+        let label = String::from_utf8_lossy(&label_bytes);
         self.set_label(&label);
     }
 }
@@ -124,7 +124,7 @@ impl InternalColorConvert for Color {
     }
 }
 
-struct Graph {
+struct Graph<const CIRC_BUF_SIZE: usize> {
     b: Bounds,
     data_range: Range<i32>,
     points: VecDeque<Coord<i32>>,
@@ -133,9 +133,11 @@ struct Graph {
     frame: Frame,
     label_frame: Frame,
     redraw: bool,
+    rolling_avg_buf: [Duration; CIRC_BUF_SIZE],
+    rolling_avg_idx: usize,
 }
 
-impl Graph {
+impl<const CIRC_BUF_SIZE: usize> Graph<CIRC_BUF_SIZE> {
     pub fn new(b: Bounds, data_range: Range<i32>) -> Self {
         let label_h = (b.h as f32 * 0.05) as i32;
         let (frame_w, frame_h) = (b.w, b.h - label_h);
@@ -143,9 +145,9 @@ impl Graph {
         let mut label_frame = Frame::new(frame.x(), frame.y() + frame.h(), b.w, label_h, "")
             .with_align(Align::Left | Align::Inside);
 
-        let graph_img = image::Image::<Vec<_>, Rgba8>::zeroed(frame_w as usize, frame_h as usize);
-        let mut bg_img = image::Image::<Vec<_>, Rgba8>::zeroed(frame_w as usize, frame_h as usize);
-        bg_img.fill_color(Color::BackGround.to_internal());
+        let graph_img = image::zeroed::<Rgba8>(frame_w as usize, frame_h as usize);
+        let mut bg_img = image::zeroed::<Rgba8>(frame_w as usize, frame_h as usize);
+        bg_img.fill_color(Palette::BG0.to_internal());
         bg_img.draw_grid(30, Palette::AQUA.to_internal());
 
         label_frame.set_label_font(Font::Courier);
@@ -162,6 +164,8 @@ impl Graph {
             frame,
             label_frame,
             redraw: false,
+            rolling_avg_buf: [Duration::default(); CIRC_BUF_SIZE],
+            rolling_avg_idx: 0,
         }
     }
 
@@ -188,9 +192,8 @@ impl Graph {
             if let Some(scaled_img) = self.img.scale_nearest(frame_w, frame_h) {
                 self.points.clear();
                 self.img = scaled_img;
-                self.bg_img =
-                    image::Image::<Vec<_>, Rgba8>::zeroed(frame_w as usize, frame_h as usize);
-                self.bg_img.fill_color(Color::BackGround.to_internal());
+                self.bg_img = image::zeroed::<Rgba8>(frame_w as usize, frame_h as usize);
+                self.bg_img.fill_color(Palette::BG0.to_internal());
                 self.bg_img.draw_grid(30, Palette::AQUA.to_internal());
             }
 
@@ -201,11 +204,15 @@ impl Graph {
         }
     }
 
-    pub fn tick(&mut self, time: Duration) {
+    pub fn tick(&mut self, single_time: Duration) {
         const INC: i32 = 3;
 
+        self.rolling_avg_idx = (self.rolling_avg_idx + 1) % CIRC_BUF_SIZE;
+        self.rolling_avg_buf[self.rolling_avg_idx] = single_time;
+        let avg_time = self.rolling_avg_buf.iter().sum::<Duration>() / CIRC_BUF_SIZE as u32;
+
         let time_norm = clamp(
-            1. - ((time.as_millis() as i32 - self.data_range.start) as f32
+            1. - ((avg_time.as_millis() as i32 - self.data_range.start) as f32
                 / self.data_range.end as f32),
             0.,
             1.,
@@ -219,7 +226,12 @@ impl Graph {
         if self.points.len() > ((self.frame.w() - 1) / INC) as usize {
             self.points.pop_front();
         };
-        self.label_frame.set_label(&format!("{:?}", time));
+        self.label_frame.set_label(&format!(
+            "Frame time: {:.2}ms | FPS: {:.0}",
+            avg_time.as_secs_f32() * 1000.,
+            1. / avg_time.as_secs_f32()
+        ));
+
         self.redraw = true;
     }
 }
@@ -237,12 +249,12 @@ impl CropBox {
         draw_frame.set_frame(FrameType::FlatBox);
 
         let mut bg_box = Group::new(b.x, b.y, b.w, b.h, "");
-        bg_box.set_frame(FrameType::RFlatBox);
+        bg_box.set_frame(app::frame_type());
         bg_box.set_color(Palette::BG0);
         bg_box.end();
 
         let mut fg_box = Group::new(b.x, b.y, b.w, b.h, "");
-        fg_box.set_frame(FrameType::RFlatBox);
+        fg_box.set_frame(app::frame_type());
         fg_box.set_color(Palette::GREEN);
         fg_box.end();
 
@@ -251,7 +263,7 @@ impl CropBox {
         });
 
         // the fg box behaves extremely wack when we let fltk handle the resizing
-        // since the bg box behaves correctly, we just resize the fg box according to it's previous proportions
+        // since the bg box behaves correctly, we just resize the fg box according to the bg box's previous proportions
         let ratio_cache = Rc::new(Cell::new((1., 1.)));
         let ratio_cache_clone = ratio_cache.clone();
         let fg_box_rc = Rc::new(RefCell::new(fg_box));
@@ -444,6 +456,8 @@ impl Gui {
 
         app::set_visible_focus(false);
         app::set_frame_type(FrameType::RFlatBox);
+        app::set_frame_border_radius_max(10);
+        app::add_handler(|ev| matches!(ev, Event::Shortcut) && (app::event_key() == (Key::Escape)));
 
         if let Ok(font) = Font::load_font("JetBrainsMono-Medium.ttf") {
             Font::set_font(Font::Courier, &font);
@@ -545,10 +559,9 @@ impl Gui {
 
         let frm_b = Bounds::new(0, 0, left_w, left_h + (GAP * 2)).gapify(GAP);
         let mut img_frame = Frame::new(frm_b.x, frm_b.y, frm_b.w, frm_b.h, "");
-        let mut img_frame_img =
-            image::Image::<Vec<_>, Rgba8>::zeroed(frm_b.w as usize, frm_b.h as usize);
+        let mut img_frame_img = image::zeroed::<Rgba8>(frm_b.w as usize, frm_b.h as usize);
 
-        let mut graph = Graph::new(
+        let mut graph = Graph::<5>::new(
             Bounds::new(0, frm_b.y + frm_b.h, left_w, left_h).gapify(GAP),
             5..50,
         );
@@ -574,11 +587,11 @@ impl Gui {
         app::add_idle3(move |_| {
             // blinking terminal cursor
             if now.elapsed() > Duration::from_secs_f32(0.5) {
-                if term.cursor_color() == Color::BackGround {
+                if term.cursor_color() == term.color() {
                     term.set_cursor_color(Color::ForeGround);
                     term.redraw();
                 } else {
-                    term.set_cursor_color(Color::BackGround);
+                    term.set_cursor_color(term.color());
                     term.redraw();
                 }
                 now = Instant::now();
@@ -654,7 +667,7 @@ impl Gui {
                     img_frame_img = resized_bg;
                 }
 
-                img_frame_img.fill_color(Color::BackGround.to_internal());
+                img_frame_img.fill_color(Palette::BG0.to_internal());
                 img_frame_img.layer_image_over(&resized_data_img);
 
                 draw::draw_rgba(&mut img_frame, img_frame_img.as_slice()).unwrap();
@@ -732,7 +745,7 @@ impl Gui {
         let box_h = (box_w as f32 * aspect_ratio) as i32;
         let crop_box = Rc::new(RefCell::new(CropBox::new(Bounds::new(x, y, box_w, box_h))));
 
-        let slider1_ypos = y + box_h + (slider_gap * 2);
+        let slider1_ypos = y + box_h + slider_gap;
         let slider2_ypos = slider1_ypos + slider_h + slider_gap;
         let mut slider1 = self.create_config_slider(
             Bounds::new(x, slider1_ypos, box_w, slider_h),
@@ -766,7 +779,7 @@ impl Gui {
             .borrow_mut()
             .change_bounds(init_x_percent, init_y_percent);
 
-        Bounds::new(x, y, box_w, box_h + (slider_h * 2) + (slider_gap * 3))
+        Bounds::new(x, y, box_w, box_h + (slider_h * 2) + (slider_gap * 2))
     }
 
     fn create_save_config_but(&self, b: Bounds, cfg_path: &'static str, c: Color) {
@@ -790,14 +803,16 @@ impl Gui {
             }
             Event::Released => {
                 app::handle_main(button_released).unwrap();
-                config.write().unwrap().write_to_file(cfg_path).unwrap();
-                log!(
-                    "Saved config to {}",
-                    match std::path::Path::new(cfg_path).canonicalize() {
-                        Ok(abs_path) => abs_path.to_string_lossy().into_owned().split_off(4), // Removing windows extended path prefix
-                        Err(_) => cfg_path.to_string(),
+                let abs_cfg_path = match std::path::Path::new(cfg_path).canonicalize() {
+                    Ok(abs_path) => abs_path.to_string_lossy().into_owned().split_off(4), // Removing windows extended path prefix
+                    Err(_) => cfg_path.to_string(),
+                };
+                match config.write().unwrap().write_to_file(cfg_path) {
+                    Ok(_) => {
+                        log!("Saved config to {}", abs_cfg_path);
                     }
-                );
+                    Err(e) => log_err!("Error saving config to {}:\n\t{}", abs_cfg_path, e),
+                }
                 true
             }
             _ => false,
@@ -809,7 +824,7 @@ impl Gui {
 
         let capture_input = unique_event_id();
 
-        let init_keycode: i32 = self.config.read().unwrap().get(cfg_key).into();
+        let init_keycode: u16 = self.config.read().unwrap().get(cfg_key).into();
         let init_string = match keycode_to_string(init_keycode) {
             Ok(string) => string,
             Err(_) => {
@@ -944,7 +959,6 @@ impl Gui {
         slider.set_color(Palette::BG0_H);
         slider.set_selection_color(color);
         slider.set_frame(app::frame_type());
-        slider.set_slider_frame(FrameType::RoundedFrame);
 
         let val_type = self.config.read().unwrap().get(cfg_key);
         let (cfg_val, bounds_start, bounds_end, precision) = match val_type {
@@ -955,7 +969,7 @@ impl Gui {
                 0,
             ),
             ValType::Float(ref v) => (
-                (v.val as f64 * 100.).trunc() / 100.,
+                (v.val as f64 * 100.).round() / 100.,
                 (*v.bounds.start() as f64 * 100.).ceil() / 100.,
                 (*v.bounds.end() as f64 * 100.).floor() / 100.,
                 2,
@@ -1005,18 +1019,9 @@ fn draw_image_overlay(
     aim_coord: Coord<usize>,
     coord_cluster: Vec<Coord<usize>>,
 ) {
-    let x_max = coord_cluster.iter().max_by_key(|coord| coord.x).unwrap().x;
-    let x_min = coord_cluster.iter().min_by_key(|coord| coord.x).unwrap().x;
-    let y_max = coord_cluster.iter().max_by_key(|coord| coord.y).unwrap().y;
-    let y_min = coord_cluster.iter().min_by_key(|coord| coord.y).unwrap().y;
+    let (x, y, w, h) = Coord::bbox_xywh(&coord_cluster[..]);
     let img_center = Coord::new(img.w / 2, img.h / 2);
-
-    img.draw_bbox(
-        Coord::new(x_min, y_min),
-        x_max - x_min,
-        y_max - y_min,
-        Palette::GREEN.to_internal(),
-    );
+    img.draw_bbox(Coord::new(x, y), w, h, Palette::GREEN.to_internal());
     img.draw_crosshair(img_center, 10, Palette::YELLOW.to_internal());
     if img_center.square_dist(aim_coord) > 4 {
         img.draw_crosshair(aim_coord, 10, Palette::RED.to_internal());

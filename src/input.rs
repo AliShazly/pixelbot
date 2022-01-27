@@ -7,7 +7,8 @@ use windows::Win32::{
     Foundation::PWSTR,
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, GetKeyNameTextW, GetKeyboardState, MapVirtualKeyW,
+            GetAsyncKeyState, GetKeyNameTextW, GetKeyboardState, MapVirtualKeyW, VK_LBUTTON,
+            VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
         },
         WindowsAndMessaging::MAPVK_VK_TO_VSC_EX,
     },
@@ -80,13 +81,13 @@ impl InterceptionState {
         self.interception.send(self.mouse_dev, &[stroke]);
     }
 
-    pub fn set_click_keycode(&mut self, keycode: i32) -> Result<(), &'static str> {
-        let (click_down, click_up) = match keycode {
-            0x01 => (MouseState::LEFT_BUTTON_DOWN, MouseState::LEFT_BUTTON_UP),
-            0x02 => (MouseState::RIGHT_BUTTON_DOWN, MouseState::RIGHT_BUTTON_UP),
-            0x04 => (MouseState::MIDDLE_BUTTON_DOWN, MouseState::MIDDLE_BUTTON_UP),
-            0x05 => (MouseState::BUTTON_4_DOWN, MouseState::BUTTON_4_UP),
-            0x06 => (MouseState::BUTTON_5_DOWN, MouseState::BUTTON_5_UP),
+    pub fn set_click_keycode(&mut self, keycode: u16) -> Result<(), &'static str> {
+        let (click_down, click_up) = match keycode.into() {
+            VK_LBUTTON => (MouseState::LEFT_BUTTON_DOWN, MouseState::LEFT_BUTTON_UP),
+            VK_RBUTTON => (MouseState::RIGHT_BUTTON_DOWN, MouseState::RIGHT_BUTTON_UP),
+            VK_MBUTTON => (MouseState::MIDDLE_BUTTON_DOWN, MouseState::MIDDLE_BUTTON_UP),
+            VK_XBUTTON1 => (MouseState::BUTTON_4_DOWN, MouseState::BUTTON_4_UP),
+            VK_XBUTTON2 => (MouseState::BUTTON_5_DOWN, MouseState::BUTTON_5_UP),
             _ => return Err("Invalid click keycode"),
         };
         self.click_down = click_down;
@@ -118,18 +119,18 @@ impl InterceptionState {
     }
 }
 
-pub fn key_pressed(key_code: i32) -> bool {
-    unsafe { GetAsyncKeyState(key_code) < 0 }
+pub fn key_pressed(key_code: u16) -> bool {
+    unsafe { GetAsyncKeyState(key_code as i32) < 0 }
 }
 
-pub fn wait_for_release(key_code: i32, timeout: Duration) {
+pub fn wait_for_release(key_code: u16, timeout: Duration) {
     let start = Instant::now();
     while key_pressed(key_code) && start.elapsed() < timeout {
         thread::sleep(Duration::from_millis(1));
     }
 }
 
-pub fn get_any_pressed_key() -> Result<Option<i32>, &'static str> {
+pub fn get_any_pressed_key() -> Result<Option<u16>, &'static str> {
     let mut buf = [0u8; 256];
     if !unsafe { GetKeyboardState(buf.as_mut_ptr()) }.as_bool() {
         return Err("GetKeyboardState failed");
@@ -139,19 +140,19 @@ pub fn get_any_pressed_key() -> Result<Option<i32>, &'static str> {
         .enumerate()
         .find(|(_, &key_state)| (key_state >> 7) == 1)
     {
-        Some((key_code, _)) => Ok(Some(key_code as i32)),
+        Some((key_code, _)) => Ok(Some(key_code as _)),
         None => Ok(None),
     }
 }
 
-pub fn keycode_to_string(key_code: i32) -> Result<String, &'static str> {
+pub fn keycode_to_string(key_code: u16) -> Result<String, &'static str> {
     // MapVirtualKeyW doesn't recognize mouse keycodes
-    match key_code {
-        0x01 => return Ok("Mouse1".to_string()),
-        0x02 => return Ok("Mouse2".to_string()),
-        0x04 => return Ok("Mouse3".to_string()),
-        0x05 => return Ok("Mouse4".to_string()),
-        0x06 => return Ok("Mouse5".to_string()),
+    match key_code.into() {
+        VK_LBUTTON => return Ok("Mouse1".to_string()),
+        VK_RBUTTON => return Ok("Mouse2".to_string()),
+        VK_MBUTTON => return Ok("Mouse3".to_string()),
+        VK_XBUTTON1 => return Ok("Mouse4".to_string()),
+        VK_XBUTTON2 => return Ok("Mouse5".to_string()),
         _ => (),
     }
 
@@ -166,7 +167,7 @@ pub fn keycode_to_string(key_code: i32) -> Result<String, &'static str> {
                 BUF_SIZE as i32,
             );
             if str_size > 0 {
-                Ok(String::from_utf16(&buf[..str_size as usize]).unwrap())
+                Ok(String::from_utf16_lossy(&buf[..str_size as usize]))
             } else {
                 Err("GetKeyNameTextW failed")
             }

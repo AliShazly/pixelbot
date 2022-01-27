@@ -1,12 +1,14 @@
 use num_derive::FromPrimitive;
 
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::error::Error;
 use std::fmt;
 use std::fmt::Display;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::BufReader;
 use std::io::Write;
+use std::lazy::SyncLazy;
 use std::ops::RangeInclusive;
 use std::path::Path;
 
@@ -29,7 +31,7 @@ impl fmt::Display for ParseError {
             Self::InvalidKey(line_num) => write!(f, "Invalid key on line {}", line_num),
             Self::OutOfBounds(line_num) => write!(f, "Out of bounds value on line {}", line_num),
             Self::NotExhaustive(_, ref missing_keys) => {
-                write!(f, "Using defaults for missng values:\n|")?;
+                write!(f, "Using defaults for missing values:\n|")?;
                 for res in missing_keys
                     .iter()
                     .map(|key| write!(f, " {} |", key.as_string()))
@@ -50,7 +52,7 @@ pub enum CfgKey {
     CropH,
     ColorThresh,
     AimDivisor,
-    YDivisor,
+    YMultiplier,
     Fps,
     MaxAutoclickSleepMs,
     MinAutoclickSleepMs,
@@ -76,7 +78,7 @@ impl CfgKey {
             CropH => Unsigned(Bounded::new(592, 0..=1440 - 1)),
             ColorThresh => Float(Bounded::new(0.83, 0.001..=0.999)),
             AimDivisor => Float(Bounded::new(3., 1.0..=10.0)),
-            YDivisor => Float(Bounded::new(1.3, 1.0..=2.0)),
+            YMultiplier => Float(Bounded::new(0.9, 0.0..=1.0)),
             Fps => Unsigned(Bounded::new(144, 1..=240)),
             MaxAutoclickSleepMs => Unsigned(Bounded::new(90, 0..=100)),
             MinAutoclickSleepMs => Unsigned(Bounded::new(50, 0..=100)),
@@ -88,7 +90,7 @@ impl CfgKey {
             ToggleAutoclickKeycode => Keycode(188),
             FakeLmbKeycode => Keycode(4),
             TargetColor => ColorRgb8(Color::<u8>::new(196, 58, 172, 255)),
-            _ => panic!("Default values not exhaustive"),
+            _Size => panic!(),
         }
     }
 
@@ -140,7 +142,7 @@ macro_rules! enum_valtype {
     };
 }
 enum_valtype!(
-    (Keycode, i32),
+    (Keycode, u16),
     (Unsigned, Bounded<u32>),
     (Float, Bounded<f32>),
     (ColorRgb8, Color<u8>)
@@ -157,14 +159,19 @@ impl Display for ValType {
     }
 }
 
+struct LineData {
+    key_val_pair: Option<(CfgKey, ValType)>,
+    comment: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct Config {
-    map: HashMap<CfgKey, ValType>,
+    map: FxHashMap<CfgKey, ValType>,
     pub is_dirty: bool,
 }
 
 impl Config {
-    fn new(mut map: HashMap<CfgKey, ValType>) -> Self {
+    fn new(mut map: FxHashMap<CfgKey, ValType>) -> Self {
         CfgKey::iter().for_each(|key| {
             map.entry(key).or_insert_with(|| key.default_val());
         });
@@ -224,96 +231,136 @@ impl Config {
     }
 
     pub fn write_to_file(&self, path: &str) -> std::io::Result<()> {
-        let content: String = CfgKey::iter()
-            .map(|k| self.map.get_key_value(&k).unwrap())
-            .map(|(k, v)| format!("{} = {}\n", k.as_string(), v))
-            .collect();
-        let mut outfile = File::create(Path::new(path))?;
-        outfile.write_all(content.as_bytes())
+        let file_path = Path::new(path);
+        let mut out_content = "".to_string();
+        let mut written_keys = FxHashSet::<CfgKey>::default();
+
+        // overwriting keys already written to file to preserve comments & line ordering
+        if let Ok(read_handle) = File::open(file_path) {
+            for (line_num, line) in BufReader::new(read_handle).lines().enumerate() {
+                let line_num = (line_num as u32) + 1;
+                match Self::parse_line(line?, line_num) {
+                    Ok(line_data) => {
+                        if let Some((k, _)) = line_data.key_val_pair {
+                            let val = self.map.get(&k).unwrap();
+                            out_content.push_str(&format!("{} = {}", k.as_string(), val));
+                            written_keys.insert(k);
+                            if line_data.comment.is_some() {
+                                out_content.push(' '); // Adding a space before inline comments
+                            }
+                        }
+                        if let Some(comment) = line_data.comment {
+                            out_content.push('#');
+                            out_content.push_str(&comment);
+                        }
+                        out_content.push('\n');
+                    }
+                    Err(_) => continue, // skip lines that don't parse correctly
+                };
+            }
+        }
+
+        // writing the rest of the unwritten values
+        out_content.push_str(
+            &CfgKey::iter()
+                .filter(|k| !written_keys.contains(k))
+                .map(|k| self.map.get_key_value(&k).unwrap())
+                .map(|(k, v)| format!("{} = {}\n", k.as_string(), v))
+                .collect::<String>(),
+        );
+
+        File::create(file_path)?.write_all(out_content.as_bytes())
     }
 
-    pub fn from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let key_lookup: HashMap<String, CfgKey> =
-            HashMap::from_iter(CfgKey::iter().map(|k| k.as_string()).zip(CfgKey::iter()));
-        let mut map: HashMap<CfgKey, ValType> = HashMap::new();
+    pub fn from_file(path: &str) -> Result<Self, Box<dyn Error>> {
+        let mut out_map: FxHashMap<CfgKey, ValType> = FxHashMap::default();
         let infile = File::open(Path::new(path))?;
         for (line_num, line) in BufReader::new(infile).lines().enumerate() {
             let line_num = (line_num as u32) + 1;
-            let line_processed: String = line?
-                .chars()
-                .filter(|x| *x != ' ') // removing whitespace
-                .take_while(|x| *x != '#') // ending line at first comment
-                .collect();
-            if line_processed.is_empty() {
-                continue;
+            let LineData { key_val_pair, comment: _ } = Self::parse_line(line?, line_num)?;
+            if let Some((k, v)) = key_val_pair {
+                out_map.insert(k, v);
             }
-            let line_split: Vec<&str> = line_processed.split('=').collect();
-            if line_split.len() != 2 {
-                return Err(
-                    ParseError::Parse(line_num, "Multiple delimiters found".to_string()).into(),
-                );
-            }
-
-            let key = key_lookup
-                .get(
-                    &line_split[0]
-                        .parse::<String>()
-                        .map_err(|e| ParseError::Parse(line_num, format!("{}", e)))?,
-                )
-                .ok_or(ParseError::InvalidKey(line_num))?;
-
-            // matching the default value for type info
-            let value = match key.default_val() {
-                ValType::Keycode(_) => ValType::Keycode(
-                    line_split[1]
-                        .parse::<i32>()
-                        .map_err(|e| ParseError::Parse(line_num, format!("{}", e)))?,
-                ),
-                ValType::Unsigned(v) => {
-                    let val = line_split[1]
-                        .parse::<u32>()
-                        .map_err(|e| ParseError::Parse(line_num, format!("{}", e)))?;
-                    if !v.bounds.contains(&val) {
-                        return Err(Box::new(ParseError::OutOfBounds(line_num)));
-                    }
-                    ValType::Unsigned(Bounded::new(val, v.bounds))
-                }
-                ValType::Float(v) => {
-                    let val = line_split[1]
-                        .parse::<f32>()
-                        .map_err(|e| ParseError::Parse(line_num, format!("{}", e)))?;
-                    if !v.bounds.contains(&val) {
-                        return Err(Box::new(ParseError::OutOfBounds(line_num)));
-                    }
-                    ValType::Float(Bounded::new(val, v.bounds))
-                }
-                ValType::ColorRgb8(_) => {
-                    let mut rgb = Vec::with_capacity(3);
-                    for res in line_split[1].split(',').map(|num| num.parse::<u8>()) {
-                        rgb.push(res.map_err(|e| ParseError::Parse(line_num, format!("{}", e)))?)
-                    }
-                    if rgb.len() != 3 {
-                        return Err(Box::new(ParseError::Parse(
-                            line_num,
-                            "Color tuple doesn't have 3 elements".to_string(),
-                        )));
-                    }
-                    ValType::ColorRgb8(Color::new(rgb[0], rgb[1], rgb[2], 255))
-                }
-            };
-            map.insert(*key, value);
         }
 
-        let unused_keys: Vec<CfgKey> = CfgKey::iter().filter(|k| !map.contains_key(k)).collect();
+        let unused_keys: Vec<CfgKey> = CfgKey::iter()
+            .filter(|k| !out_map.contains_key(k))
+            .collect();
         if unused_keys.is_empty() {
-            Ok(Config::new(map))
+            Ok(Config::new(out_map))
         } else {
             // Config::new() auto fills in unused keys with defaults
-            Err(Box::new(ParseError::NotExhaustive(
-                Config::new(map),
-                unused_keys,
-            )))
+            Err(ParseError::NotExhaustive(Config::new(out_map), unused_keys).into())
         }
+    }
+
+    fn parse_line(line: String, line_num: u32) -> Result<LineData, ParseError> {
+        static KEY_LOOKUP: SyncLazy<FxHashMap<String, CfgKey>> = SyncLazy::new(|| {
+            FxHashMap::from_iter(CfgKey::iter().map(|k| k.as_string()).zip(CfgKey::iter()))
+        });
+
+        let (mut key_val, comment) = match line.split_once('#') {
+            Some((key_val, comment)) => (key_val.to_string(), Some(comment.to_string())),
+            None => (line, None),
+        };
+        key_val.retain(|c| c != ' ');
+        let (key_str, val_str) = match key_val.split_once('=') {
+            Some((key_str, val_str)) => (key_str, val_str),
+            None => {
+                if key_val.is_empty() {
+                    return Ok(LineData { key_val_pair: None, comment }); // empty line is valid
+                } else {
+                    return Err(ParseError::Parse(line_num, "No delimiter".into()));
+                }
+            }
+        };
+
+        let key = KEY_LOOKUP
+            .get(key_str)
+            .ok_or(ParseError::InvalidKey(line_num))?;
+
+        // matching the default value for type info
+        let val = match key.default_val() {
+            ValType::Keycode(_) => ValType::Keycode(
+                val_str
+                    .parse::<u16>()
+                    .map_err(|e| ParseError::Parse(line_num, format!("{}", e)))?,
+            ),
+            ValType::Unsigned(v) => {
+                let val = val_str
+                    .parse::<u32>()
+                    .map_err(|e| ParseError::Parse(line_num, format!("{}", e)))?;
+                if !v.bounds.contains(&val) {
+                    return Err(ParseError::OutOfBounds(line_num));
+                }
+                ValType::Unsigned(Bounded::new(val, v.bounds))
+            }
+            ValType::Float(v) => {
+                let val = val_str
+                    .parse::<f32>()
+                    .map_err(|e| ParseError::Parse(line_num, format!("{}", e)))?;
+                if !v.bounds.contains(&val) {
+                    return Err(ParseError::OutOfBounds(line_num));
+                }
+                ValType::Float(Bounded::new(val, v.bounds))
+            }
+            ValType::ColorRgb8(_) => {
+                let mut rgb = [0u8; 3];
+                let mut elems = 0;
+                for res in val_str.split(',').map(|num| num.parse::<u8>()) {
+                    rgb[elems] = res.map_err(|e| ParseError::Parse(line_num, format!("{}", e)))?;
+                    elems += 1;
+                }
+                if elems != 3 {
+                    return Err(ParseError::Parse(line_num, "Invalid color".into()));
+                }
+                ValType::ColorRgb8(Color::new(rgb[0], rgb[1], rgb[2], 255))
+            }
+        };
+        Ok(LineData {
+            key_val_pair: Some((*key, val)),
+            comment,
+        })
     }
 }
 

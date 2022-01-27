@@ -1,3 +1,4 @@
+use crate::capture::{CaptureError, DXGICapturer};
 use crate::config::{Bounded, CfgKey, Config, ValType};
 use crate::coord::Coord;
 use crate::image::{Bgra8, Color, Image};
@@ -6,7 +7,7 @@ use crate::logging::{log, log_err};
 
 use crossbeam::channel::{self, Receiver, Sender};
 use rand::{self, Rng};
-use std::io::ErrorKind::WouldBlock;
+use rustc_hash::FxHashSet;
 use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -118,8 +119,8 @@ impl PixelBot {
 
         thread::spawn(move || {
             let mut enabled = true;
-            let mut capturer = scrap::Capturer::new(scrap::Display::primary().unwrap()).unwrap();
-            let (screen_w, screen_h) = (capturer.width(), capturer.height());
+            let mut capturer = DXGICapturer::new().unwrap();
+            let (screen_w, screen_h) = capturer.dims();
             let interception = InterceptionState::new(mouse_dev).unwrap();
             log!(
                 "Starting aim thread on primary display\nScreen size: {}x{}",
@@ -137,14 +138,14 @@ impl PixelBot {
                     <ValType as Into<Bounded<_>>>::into(cfg.get(CfgKey::ColorThresh)).val;
                 let aim_divisor: f32 =
                     <ValType as Into<Bounded<_>>>::into(cfg.get(CfgKey::AimDivisor)).val;
-                // let y_divisor: f32 =
-                //     <ValType as Into<Bounded<_>>>::into(*cfg.get(CfgKey::YDivisor)).val;
+                let y_multiplier: f32 =
+                    <ValType as Into<Bounded<_>>>::into(cfg.get(CfgKey::YMultiplier)).val;
                 let aim_dur: u32 =
                     <ValType as Into<Bounded<_>>>::into(cfg.get(CfgKey::AimDurationMicros)).val;
                 let aim_steps: u32 =
                     <ValType as Into<Bounded<_>>>::into(cfg.get(CfgKey::AimSteps)).val;
-                let aim_key = <ValType as Into<i32>>::into(cfg.get(CfgKey::AimKeycode));
-                let toggle_key = <ValType as Into<i32>>::into(cfg.get(CfgKey::ToggleAimKeycode));
+                let aim_key: u16 = cfg.get(CfgKey::AimKeycode).into();
+                let toggle_key: u16 = cfg.get(CfgKey::ToggleAimKeycode).into();
                 let target_color = <ValType as Into<Color<u8>>>::into(cfg.get(CfgKey::TargetColor));
                 drop(cfg);
 
@@ -168,41 +169,59 @@ impl PixelBot {
                     }
 
                     // Grab DXGI buffer
-                    let buffer = match capturer.frame() {
-                        Ok(buffer) => buffer,
-                        Err(error) => {
-                            if error.kind() == WouldBlock {
-                                spin_sleep::sleep(Duration::from_secs_f32(1. / fps as f32));
-                                continue;
-                            } else {
-                                panic!("Error: {}", error);
-                            }
+                    let buffer = match capturer.capture_frame(0) {
+                        Ok(Some(buffer)) => buffer,
+                        Ok(None) => {
+                            spin_sleep::sleep(Duration::from_secs_f32(1. / fps as f32));
+                            continue;
                         }
+                        Err(e) => match e {
+                            CaptureError::AccessLost => {
+                                log!("Capture access lost, reloading...");
+                                capturer.reload().unwrap();
+                                continue;
+                            }
+                            CaptureError::WinErr(e) => {
+                                panic!("err {:#x}: {}", e.code().0, e.message())
+                            }
+                        },
                     };
 
                     // Crop image
-                    let buf_img: Image<_, Bgra8> = Image::new(&(*buffer), screen_w, screen_h);
-                    let cropped = buf_img.crop_to_center(crop_w as usize, crop_h as usize);
+                    let cropped = buffer.crop_to_center(crop_w as usize, crop_h as usize);
 
                     // to send to gui for visualizations
                     let mut target_coords: Option<Vec<Coord<usize>>> = None; // Vec of detected pixel coords
                     let mut aim_coord: Option<Coord<usize>> = None; // Average of all the detected pixel coords
 
+                    // min area for coordinate clusters
+                    let min_area = (cropped.w / 20) * (cropped.h / 20);
+
                     // Search through image and find avg position of the target color
-                    let mut relative_coord = match cropped.detect_color(target_color, color_thresh)
-                    {
-                        Some(coords) => {
-                            let count = coords.len();
+                    let mut found_coods = cropped.detect_color(target_color, color_thresh);
+                    let mut relative_coord = match loop {
+                        match take_any_cluster(&mut found_coods, 2, (cropped.w, cropped.h)) {
+                            Some(cluster) => {
+                                let (_, _, w, h) = Coord::bbox_xywh(&cluster[..]);
+                                if w * h > min_area {
+                                    break Some(cluster);
+                                }
+                            }
+                            None => break None,
+                        }
+                    } {
+                        Some(cluster) => {
+                            let count = cluster.len();
 
                             // Getting avg position of detected points
                             let mut coord_sum = Coord::new(0, 0);
-                            coords.iter().for_each(|&coord| coord_sum += coord);
+                            cluster.iter().for_each(|&coord| coord_sum += coord);
                             let coords_avg = Coord::new(
                                 coord_sum.x / count,
-                                coord_sum.y / count, // TODO: Need to make make this lower to bias aim towards head, y_divisor is broke af
+                                ((coord_sum.y / count) as f32 * y_multiplier) as usize,
                             );
 
-                            target_coords = Some(coords);
+                            target_coords = Some(cluster);
                             aim_coord = Some(coords_avg);
 
                             // making coord relative to center
@@ -211,6 +230,7 @@ impl PixelBot {
                                 coords_avg.y as i32 - (cropped.h / 2) as i32,
                             )
                         }
+                        // Found target pixels, but no clusters greater than min_area
                         None => Coord::new(0, 0),
                     };
 
@@ -256,12 +276,10 @@ impl PixelBot {
 
             'outer: loop {
                 let cfg = config.read().unwrap();
-                let autoclick_key: i32 =
-                    <ValType as Into<i32>>::into(cfg.get(CfgKey::AutoclickKeycode));
-                let toggle_autoclick_key: i32 =
-                    <ValType as Into<i32>>::into(cfg.get(CfgKey::ToggleAutoclickKeycode));
-                let fake_lmb_key: i32 =
-                    <ValType as Into<i32>>::into(cfg.get(CfgKey::FakeLmbKeycode));
+                let autoclick_key: u16 = cfg.get(CfgKey::AutoclickKeycode).into();
+                let toggle_autoclick_key: u16 = cfg.get(CfgKey::ToggleAutoclickKeycode).into();
+                let fake_lmb_key: u16 = cfg.get(CfgKey::FakeLmbKeycode).into();
+
                 let mut max_sleep: u32 =
                     <ValType as Into<Bounded<_>>>::into(cfg.get(CfgKey::MaxAutoclickSleepMs)).val;
                 let mut min_sleep: u32 =
@@ -315,14 +333,19 @@ impl PixelBot {
                         ClickMode::Regular => {}
                         ClickMode::Auto => {
                             if key_pressed(autoclick_key) {
+                                let (sleep1, sleep2) = if (min_sleep..max_sleep).is_empty() {
+                                    (max_sleep.into(), max_sleep.into())
+                                } else {
+                                    (
+                                        rng.gen_range(min_sleep..max_sleep).into(),
+                                        rng.gen_range(min_sleep..max_sleep).into(),
+                                    )
+                                };
+
                                 interception.click_down();
-                                spin_sleep::sleep(Duration::from_millis(
-                                    rng.gen_range(min_sleep..max_sleep).into(),
-                                ));
+                                spin_sleep::sleep(Duration::from_millis(sleep1));
                                 interception.click_up();
-                                spin_sleep::sleep(Duration::from_millis(
-                                    rng.gen_range(min_sleep..max_sleep).into(),
-                                ));
+                                spin_sleep::sleep(Duration::from_millis(sleep2));
                             }
                         }
                         ClickMode::Redirected(ref mut was_pressed) => {
@@ -341,4 +364,64 @@ impl PixelBot {
             }
         })
     }
+}
+
+fn coord_neighbors(c: Coord<usize>, range: u32) -> Vec<Coord<usize>> {
+    (1..range as usize + 1)
+        .flat_map(|offset| {
+            let (xinc, yinc) = (c.x + offset, c.y + offset);
+            let (xdec, ydec) = (
+                (c.x as isize - offset as isize) as usize,
+                (c.y as isize - offset as isize) as usize,
+            );
+            [
+                Coord::new(xdec, ydec),
+                Coord::new(c.x, ydec),
+                Coord::new(xinc, ydec),
+                Coord::new(c.x, yinc),
+                Coord::new(xinc, c.y),
+                Coord::new(xdec, c.y),
+                Coord::new(xdec, yinc),
+                Coord::new(xinc, yinc),
+            ]
+        })
+        .collect()
+}
+
+fn take_any_cluster(
+    coords: &mut FxHashSet<Coord<usize>>,
+    radius: u32,
+    dims: (usize, usize),
+) -> Option<Vec<Coord<usize>>> {
+    if coords.is_empty() {
+        return None;
+    }
+
+    // starting cluster with the closest coord to the middle of the plane
+    let ref_coord = Coord { x: dims.0 / 2, y: dims.1 / 2 };
+    let mut init_coord = ref_coord;
+    let mut closest_dist = i32::MAX;
+    for coord in coords.iter() {
+        let dist = coord.square_dist(ref_coord);
+        if dist < closest_dist {
+            init_coord = *coord;
+            closest_dist = dist;
+        }
+    }
+    coords.remove(&init_coord);
+
+    let mut out = vec![init_coord];
+    for i in 0.. {
+        match out.get(i) {
+            Some(coord) => {
+                for neighbor in coord_neighbors(*coord, radius) {
+                    if coords.take(&neighbor).is_some() {
+                        out.push(neighbor);
+                    }
+                }
+            }
+            None => break,
+        }
+    }
+    Some(out)
 }

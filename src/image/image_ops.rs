@@ -1,8 +1,9 @@
 extern crate line_drawing;
 use crate::coord::Coord;
 use crate::image::blend::{avx_blend_over, avx_blend_under, over, under};
-use crate::image::{get_2d_idx, pack_rgb, Color, Image, Pixel, PixelMut, Subpixel};
+use crate::image::{self, get_2d_idx, Color, Image, Pixel, PixelMut, Subpixel};
 
+use rustc_hash::FxHashSet;
 use std::assert;
 use std::ops::{Deref, DerefMut, Index};
 
@@ -47,7 +48,7 @@ where
             return None;
         }
 
-        let mut out = Image::<Vec<_>, _>::zeroed(new_w, new_h);
+        let mut out = image::zeroed(new_w, new_h);
         for x in 0..new_w {
             for y in 0..new_h {
                 let src_x =
@@ -188,31 +189,40 @@ where
 {
     pub fn blend(&mut self, blend_type: BlendType, other_img: &Image<T, S>) {
         assert!(self.w == other_img.w && self.h == other_img.h);
-
+        let blend_fn = match blend_type {
+            BlendType::Over => over,
+            BlendType::Under => under,
+        };
         if std::is_x86_feature_detected!("avx2") {
-            let blend_fn = match blend_type {
+            let avx_blend_fn = match blend_type {
                 BlendType::Over => avx_blend_over,
                 BlendType::Under => avx_blend_under,
             };
 
             const STEP: usize = 32; // 32 subpixels (8 RGBA pixels) at a time; 8 * S::N_SUBPX
+            let buf_len = self.buf.len();
 
-            // FIXME: blend_fn accesses out of bounds without subtracting 32 from the range
-            //      you need to do one final pass of blending for the last chunk of pixels which may not have a length of 32
-            for idx in (0..(self.w * self.h * S::N_SUBPX) - STEP).step_by(STEP) {
+            // making sure we don't write off the edge
+            let iter_len = STEP * (buf_len / STEP);
+            for idx in (0..iter_len).step_by(STEP) {
                 unsafe {
-                    blend_fn(
+                    avx_blend_fn(
                         self.buf[idx..].as_ptr(),
                         other_img.buf[idx..].as_ptr(),
                         self.buf[idx..].as_mut_ptr(), // I think this is okay since the first pointer is never used after the inital load
                     );
                 }
             }
+
+            // if there are pixels remaining, write them with the normal blend function
+            self.pixels_mut()
+                .zip(other_img.pixels())
+                .skip(iter_len / S::N_SUBPX)
+                .for_each(|(mut fg_px, bg_px)| {
+                    let out_px = blend_fn(fg_px.as_color(), bg_px.as_color());
+                    fg_px.set(out_px);
+                });
         } else {
-            let blend_fn = match blend_type {
-                BlendType::Over => over,
-                BlendType::Under => under,
-            };
             self.pixels_mut()
                 .zip(other_img.pixels())
                 .for_each(|(mut fg_px, bg_px)| {
@@ -222,47 +232,24 @@ where
         }
     }
 
-    pub fn detect_color(&self, target: Color<S::Inner>, thresh: f32) -> Option<Vec<Coord<usize>>> {
+    pub fn detect_color(&self, target: Color<S::Inner>, thresh: f32) -> FxHashSet<Coord<usize>> {
         assert!(thresh > 0. && thresh < 1.);
 
-        let mut coords: Vec<Coord<usize>> = Vec::new();
-        self.pixels()
-            .map(|px| 1. - color_distance(px.as_color(), target))
-            .enumerate()
-            .for_each(|(idx, dist)| {
-                if dist > thresh {
-                    coords.push(get_2d_idx(self.w, idx));
-                }
-            });
-
-        const MIN_PIXELS: usize = 50;
-        if coords.len() > MIN_PIXELS {
-            Some(coords)
-        } else {
-            None
-        }
-    }
-
-    pub fn show(&self) {
-        let (width, height) = (self.w, self.h);
-        let buf_packed: Vec<u32> = (0..self.w * self.h)
-            .map(|idx| self.get_pixel(idx))
-            .map(|px| {
-                let [r, g, b, _] = px.rgba();
-                pack_rgb(r, g, b)
-            })
-            .collect();
-        let mut window =
-            minifb::Window::new("Image", width, height, minifb::WindowOptions::default()).unwrap();
-        window.limit_update_rate(Some(std::time::Duration::from_micros(16600)));
-        while window.is_open() && !window.is_key_down(minifb::Key::Escape) {
-            // window.set_position(-1920, 0);
-            window
-                .update_with_buffer(&buf_packed, width, height)
-                .unwrap();
-        }
+        FxHashSet::from_iter(
+            self.pixels()
+                .map(|px| 1. - color_distance(px.as_color(), target))
+                .enumerate()
+                .filter_map(|(idx, dist)| {
+                    if dist > thresh {
+                        Some(get_2d_idx(self.w, idx))
+                    } else {
+                        None
+                    }
+                }),
+        )
     }
 }
+
 // https://www.compuphase.com/cmetric.htm
 fn color_distance(p1: Color<u8>, p2: Color<u8>) -> f32 {
     let rmean = (p1.r as i32 + p2.r as i32) / 2;

@@ -134,10 +134,6 @@ where
         }
     }
 
-    pub fn zeroed(w: usize, h: usize) -> Image<Vec<S::Inner>, S> {
-        Image::new(vec![num::zero(); w * h * S::N_SUBPX], w, h)
-    }
-
     pub fn pixels(&self) -> impl Iterator<Item = impl Pixel<S> + '_> {
         self.buf.chunks_exact(S::N_SUBPX)
     }
@@ -209,9 +205,8 @@ where
     }
 }
 
-pub fn pack_rgb(r: u8, g: u8, b: u8) -> u32 {
-    let (r, g, b) = (r as u32, g as u32, b as u32);
-    (r << 16) | (g << 8) | b
+pub fn zeroed<S: Subpixel>(w: usize, h: usize) -> Image<Vec<S::Inner>, S> {
+    Image::new(vec![num::zero(); w * h * S::N_SUBPX], w, h)
 }
 
 fn get_2d_idx(width: usize, idx: usize) -> Coord<usize> {
