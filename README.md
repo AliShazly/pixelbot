@@ -20,7 +20,9 @@ Aims for you in FPS games by detecting colored outlines around enemies.
 
 ## Features???
 
--   AVX2 alpha blending
+-   [AVX2 alpha blending](https://gist.github.com/AliShazly/39bd8dbf85533c70d260d3cd62a818c0)
 -   Real-time FPS graph
 -   Custom config file parser
--   _pretty colors_ ![colors](https://user-images.githubusercontent.com/44154670/166624216-2c990bc4-fa2b-404b-be61-0ba7654d36e2.gif)
+-   _pretty colors_
+
+![colors](https://user-images.githubusercontent.com/44154670/166624216-2c990bc4-fa2b-404b-be61-0ba7654d36e2.gif)
