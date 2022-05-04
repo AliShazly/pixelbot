@@ -465,7 +465,7 @@ impl Gui {
         if let Ok(font) = Font::load_font("JetBrainsMono-Bold.ttf") {
             Font::set_font(Font::CourierBold, &font);
         }
-        let window = Window::new(w / 2, h / 2, w, h, "ayooo");
+        let window = Window::new(w / 2, h / 2, w, h, "pb");
 
         let capture_input_lock = Rc::new(Cell::new(false));
 
