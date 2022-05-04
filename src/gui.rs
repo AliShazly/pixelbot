@@ -459,10 +459,10 @@ impl Gui {
         app::set_frame_border_radius_max(10);
         app::add_handler(|ev| matches!(ev, Event::Shortcut) && (app::event_key() == (Key::Escape)));
 
-        if let Ok(font) = Font::load_font("JetBrainsMono-Medium.ttf") {
+        if let Ok(font) = Font::load_font("assets/JetBrainsMono-Medium.ttf") {
             Font::set_font(Font::Courier, &font);
         }
-        if let Ok(font) = Font::load_font("JetBrainsMono-Bold.ttf") {
+        if let Ok(font) = Font::load_font("assets/JetBrainsMono-Bold.ttf") {
             Font::set_font(Font::CourierBold, &font);
         }
         let window = Window::new(w / 2, h / 2, w, h, "pb");
